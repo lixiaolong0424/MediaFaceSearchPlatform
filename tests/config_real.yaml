@@ -1,0 +1,24 @@
+# 真实素材抽查配置：只扫 E:\晚上 的前若干文件，用于验证真实数据上的扫描/抽帧。
+# 不写入正式库，全部落在 tests/_real/ 下。
+project_root: "D:/DATA/PROJECT/建设多媒体整理系统"
+media_root: "E:/晚上"
+
+paths:
+  nvme_root: "${project_root}/tests/_real/nvme"
+  frames: "${project_root}/tests/_real/nvme/frames"
+  thumbs: "${project_root}/tests/_real/nvme/thumbs"
+  faces_raw: "${project_root}/tests/_real/nvme/faces/raw"
+  faces_thumbs: "${project_root}/tests/_real/nvme/faces/thumbs"
+  embeddings: "${project_root}/tests/_real/nvme/embeddings"
+  query_cache: "${project_root}/tests/_real/nvme/query_cache"
+  export: "${project_root}/tests/_real/export"
+  logs: "${project_root}/tests/_real/logs"
+  tmp: "${project_root}/tests/_real/tmp"
+
+db:
+  path: "${project_root}/tests/_real/library_real.db"
+
+# 真实素材体积大：抽查时用更严格的过滤，避免误判
+library:
+  min_photo_bytes: 4096
+  min_video_bytes: 51200

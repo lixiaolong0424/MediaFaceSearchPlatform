@@ -1,0 +1,33 @@
+# 冒烟测试专用配置：只覆盖路径，其余阈值全部继承 config.yaml
+# 用法：python 01_manifest.py --config tests/config_smoke.yaml
+project_root: "D:/DATA/PROJECT/建设多媒体整理系统"
+media_root: "D:/DATA/PROJECT/建设多媒体整理系统/tests/media_smoke"
+
+paths:
+  nvme_root: "${project_root}/tests/_smoke/nvme"
+  frames: "${project_root}/tests/_smoke/nvme/frames"
+  thumbs: "${project_root}/tests/_smoke/nvme/thumbs"
+  faces_raw: "${project_root}/tests/_smoke/nvme/faces/raw"
+  faces_thumbs: "${project_root}/tests/_smoke/nvme/faces/thumbs"
+  embeddings: "${project_root}/tests/_smoke/nvme/embeddings"
+  query_cache: "${project_root}/tests/_smoke/nvme/query_cache"
+  export: "${project_root}/tests/_smoke/export"
+  logs: "${project_root}/tests/_smoke/logs"
+  tmp: "${project_root}/tests/_smoke/tmp"
+
+db:
+  path: "${project_root}/tests/_smoke/library_smoke.db"
+
+ui:
+  static_port: 18502
+  page_size: 10
+  fetch_limit: 11
+
+# ⚠️ 必须隔离向量库！
+# 原来这里没有覆盖 collection 名，冒烟测试会直接写进**生产**的 materials_semantic /
+# materials_faces，然后 reconcile 会看到「库里 6 个点、期望 43 万」这种巨额差异，
+# 更糟的是冒烟用的假素材会混进真实检索结果里。2026-10-16 补上。
+semantic:
+  collection: smoke_semantic
+faces:
+  collection: smoke_faces

@@ -1,0 +1,488 @@
+# =============================================================================
+# 素材人脸检索系统 · 唯一配置入口 (v3.1 Windows)
+# 规格第十四章：所有阈值 / 采样率 / 分页大小 / 预算上限均在此定义，禁止硬编码。
+#
+# 变量：${project_root} 由 src/common.py 在加载时展开（不做系统环境变量替换，
+#       以免误伤 Windows 的 %VAR% 语义）。路径一律用正斜杠或双反斜杠。
+# =============================================================================
+
+project_root: "D:/DATA/PROJECT/建设多媒体整理系统"
+
+# 素材根目录：用户在 UI 或此文件指定。规格默认 E:\（用户 2026-10 确认「严格 E:\」）。
+media_root: "E:/"
+
+paths:
+  bin: "${project_root}/bin"                  # ffmpeg.exe / ffprobe.exe
+  data: "${project_root}/data"
+  nvme_root: "${project_root}/data/nvme"      # 派生物与索引（硬上限见 storage.nvme_budget_gb）
+  frames: "${project_root}/data/nvme/frames"  # 关键帧 JPEG  【可再生·LRU 淘汰】
+  thumbs: "${project_root}/data/nvme/thumbs"  # 素材缩略图    【永不淘汰】
+  faces_raw: "${project_root}/data/nvme/faces/raw"      # 人脸 112x112 【永不淘汰】
+  faces_thumbs: "${project_root}/data/nvme/faces/thumbs" # 人脸墙 128  【永不淘汰】
+  embeddings: "${project_root}/data/nvme/embeddings"
+  query_cache: "${project_root}/data/nvme/query_cache"
+  export: "${project_root}/data/export"
+  logs: "${project_root}/logs"
+  tmp: "${project_root}/tmp"
+
+db:
+  # 用户拍板：library.db（规格第 3 章目录树 + 第 14 章 config.yaml 一致；
+  # 规格第 4 章正文里的 state.db 为遗留笔误）
+  path: "${project_root}/data/library.db"
+  journal_mode: WAL
+  synchronous: NORMAL
+
+library:
+  # ext_whitelist 使用小写；比对时对扩展名 .lower()
+  ext_whitelist: [jpg, jpeg, png, webp, mp4, mov, mkv, avi, m4v]
+  photo_ext: [jpg, jpeg, png, webp]
+  video_ext: [mp4, mov, mkv, avi, m4v]
+  # 严格 E:\ 会递归进回收站等目录：按「目录名」黑名单跳过（大小写不敏感、任意深度生效）。
+  #
+  # 注意语义边界：这里只比对目录名，不支持通配符/正则，也不看完整路径。
+  # 因此列在这里的名字**在任何层级**都会被整体跳过（整棵子树不递归）。
+  #
+  # 2026-10-15 按用户要求移除了三个网盘/下载器目录：
+  #   "迅雷云盘" / "BaiduNetdiskDownload" / "QuarkDownload"
+  # 理由：这三个目录里有用户真正要的素材。实测它们合计约 6.8 万素材、近 1 TB，
+  # 其中包括 E:\晚上\迅雷云盘（1.7 万），移除后重扫会全部纳入索引。
+  # 只有 Windows 系统目录与本项目自身的派生物/代码目录仍然排除。
+  dir_blacklist:
+    # --- Windows 系统目录：扫了只会浪费 IO 并产生误报 ---
+    - "$RECYCLE.BIN"
+    - "System Volume Information"
+    - "Recovery"
+    # --- 避免「索引器把自己产出的东西再索引一遍」 ---
+    # 项目根是 D:\...，与 media_root（E:\）不同盘，正常不会自我索引；
+    # 这几项是防止把 media_root 指到代码/项目目录时的自噬保护。
+    - ".git"
+    - ".venv"
+    - "node_modules"
+    - "__pycache__"
+    - "weights"
+    - "weight"
+    # ⚠️ "data" 请注意：它在**任意深度**生效，若素材里存在名为 data 的目录，
+    #    其中内容会被静默跳过。当前 E 盘未发现同名目录，故保留。
+    - "data"
+    # --- 网盘目录 ---
+    # 你只要求移除 迅雷云盘 / BaiduNetdiskDownload / QuarkDownload 三项，
+    # 115网盘 不在其中，故保持排除。若也要纳入索引，删掉下面这行即可。
+    - "115网盘"
+  # 硬过滤：小于此体积的照片视为缩略图/损坏，直接跳过（字节）
+  min_photo_bytes: 2048
+  min_video_bytes: 20480
+
+  # 处理顺序 / 视频内排序 / 照片单趟融合：见下方 scan: 段。
+  # ⚠️ 这些键原来写在本段（library:）里，但代码一律用 cfg.get("scan.xxx") 读取，
+  #    等于从未生效（只是恰好与代码默认值一致才没暴露）。2026-10-16 统一挪走了。
+
+storage:
+  nvme_budget_gb: 300
+  budget_warn_ratio: 0.80        # NVMe 使用 > 80% → banner 告警并暂停增量入库
+  frames_keep_policy: lru
+  # 照片墙 / 关键帧的短边像素（规格 2.4：keyframe_short_edge: 384）
+  keyframe_short_edge: 384
+  # 照片的 NVMe 缓存图短边（仅在 scan.photo_cache_enabled 时产出）。
+  #
+  # 为什么比视频关键帧的 384 大：视频关键帧只喂语义编码，
+  # 而照片缓存图要**同时**喂语义编码与人脸检测（F1）——
+  # 384 会让原图里 300px 的人脸缩到 ~29px，漏检严重。
+  # 768 下同样的人脸约 58~77px，SCRFD 能稳定检出。
+  # 体积：263k 张唯一照片 × 约 90KB ≈ 24GB（NVMe 预算 300GB）。
+  photo_cache_short_edge: 768
+  thumb_long_edge: 320
+  thumb_format: webp
+  face_thumb_px: 128
+  face_thumb_quality: 80
+  face_raw_px: 112
+  query_cache_ttl_hours: 24
+  orphan_missing_days: 30        # status=missing 超 30 天才允许物理删除
+  free_space_min_gb: 30          # 启动自检：剩余空间 >= 30GB
+
+scan:
+  # 关键字：inode 稳定性探测 + 五类判定（new/modified/moved/unchanged/missing）
+  inode_probe_on_boot: true
+  # 每多少文件提交一次。
+  # ⚠️ 2026-10-16：从 500 降到 100。原因：照片链现在**故意**让 3 个语义编码进程
+  #   与抽帧并行（把 24 小时的 GPU 编码藏进 17 小时的读盘里）。
+  #   SQLite 是单写者；抽帧每「批量」个文件才提交一次，期间持有写锁。
+  #   500 个 ≈ 一分钟 → 编码进程即使 60 秒 busy_timeout 也会超时退出。
+  #   降到 100（约 10 秒）后锁窗口足够短，配合 src/db.py 的 retry_on_lock 即可稳定并发。
+  batch_commit_files: 100
+
+  # 融合照片趟（03_extract --kind photo）每多少个文件提交一次。
+  # ⚠️ 必须是 1，别调大（2026-10-16 实测）：照片链让 3 个语义编码进程与抽帧并行，
+  #   SQLite 只有一个写者；提交间隔就是写锁窗口。
+  #   设成 1 → 窗口毫秒级，编码进程正常跑（实测 3 进程 9.55 张/秒 = 2.65x）；
+  #   设成 100 → 窗口约 12 秒，编码进程实测 CPU=0 / 磁盘IO=0 完全饿死（0.06 文件/秒）。
+  #   WAL + synchronous=NORMAL 下提交不触发 fsync，逐文件提交的代价可忽略。
+  commit_batch_fused_photos: 1
+  follow_symlinks: false
+
+  # 单张图片的像素上限（覆盖 PIL 的 MAX_IMAGE_PIXELS）。
+  # ⚠️ 必须放开，别用 PIL 默认值（2026-10-16 实测）：PIL 默认硬上限约 1.79 亿像素，
+  #   而本机素材里有一批 1.79 亿~7.71 亿像素的大图（AI 放大 / 拼接长图），
+  #   它们是正常图片。用默认值时全集实测有上千张被判「图片解码失败」记成
+  #   error、永远进不了库（日志里看着只像坏文件，极容易被忽略）。
+  # ⚠️ 2026-10-18 再上调：5 亿 → 9 亿。一批 34048×22656 = **7.71 亿像素**的图
+  #   仍被 5 亿挡住（实测 1,298 张，占全集 0.27%）。
+  #   内存代价：7.71 亿像素解成 RGB 约 2.3 GB；抽帧单文件串行，本机 66GB 够用；
+  #   04/06 读的是 NVMe 缓存图，不会碰巨图。设 0 表示完全不限制。
+  max_image_pixels: 900000000
+
+  # 单文件抽帧最多重试几次，超过即入 dead_letter、不再被选中。
+  # ⚠️ 必须有上限（2026-10-18 修的真实 bug）：取数条件是 `status IN ('pending','error')`，
+  #   没有上限时「永远解不开的文件」每轮都会被重新选中、再失败一次。
+  #   照片跑完后残留 1,506 个这种文件（1,467 个是 E:\晚上\美女 下真正损坏的图，
+  #   还有 macOS 的 `._xxx.jpg` 资源叉文件），导致链条退出条件 `pending == 0`
+  #   永远不成立 —— 实测它空转了近 10 小时（每轮 1~2 分钟、处理 0 个），
+  #   **24,423 个视频一个都没开始**。设 3 次后循环即可正常推进。
+  max_extract_attempts: 3
+
+  # ---- 处理顺序 ----
+  #
+  # process_order: photo_first（默认）| file_id
+  #
+  # 为什么默认 photo_first（2026-10 实测）：
+  #   照片走 process_photo，只读 EXIF、不抽帧，约 200+ 张/秒；
+  #   视频走 process_video，要整片解码做镜头切分，单个约 15~30s。
+  #   2.4 万视频 ≈ 10~20 小时，而 47.8 万照片只要几分钟。
+  #   先跑照片能立刻拿到可用的检索库，视频在后台慢慢补。
+  #
+  # 注意：切回 file_id 不会重复劳动。已完成的文件在 stage_status 里记为 done，
+  #       两种顺序共用同一套断点续跑标记，只是「先取谁」不同。
+  #
+  # ⚠️ 历史遗留：这个键和下面几个原本写在 config 的 library: 段里，
+  #    但代码一律用 cfg.get("scan.xxx") 读取，所以写在那里等于没生效
+  #    （只是恰好与代码默认值相同才没暴露）。2026-10-16 统一挪到 scan: 段。
+  process_order: photo_first
+
+  # video_size_order: asc（默认，体积升序）| desc | off（按 file_id）
+  #
+  # 为什么默认 asc（2026-10-16 实测）：视频共 24,423 个 / 6.104 TB，
+  # 单个要整片解码做镜头切分（15~30s），全集要跑好几天。
+  # 先做小体积能最快把「已完成的视频数」堆起来，界面上的素材也越早变多。
+  video_size_order: asc
+
+  # ---- 照片侧单趟读盘融合（2026-10-16，为绕开机械盘而做）----
+  #
+  # 硬件事实：E: 是 14TB SATA 机械盘（ST14000NM005G），纯读 100~170 MB/s；
+  #   照片 478,634 张 / 3.235 TB → 一趟读盘 6~9 小时。
+  #   规格原本「L2a 去重 → L2b 抽帧 → L2c 编码 → F1 检脸」每阶段都要重读照片，
+  #   在机械盘上等于 30 小时以上。
+  #
+  # fuse_photo_pipeline: true 时，03_extract.py 对照片**只读一遍**，
+  #   同时完成 EXIF + pHash 去重（L2a）+ 写 NVMe 缓存图；
+  # photo_cache_enabled: true 时缓存图写到 frames/<file_id>/0000_000000000.jpg，
+  #   于是 04_encode.py 与 06_face_detect.py 后续全部只读 NVMe，不再碰机械盘。
+  #
+  # ⚠️ 两个注意点：
+  #   1) 融合模式与 --shard 不兼容（每个分片各有一份去重索引，代表项会打架）；
+  #      分片时请改用 02_dedup.py 单独去重，或把 fuse_photo_pipeline 置 false。
+  #   2) 人脸检测读的是缓存图，分辨率 = storage.photo_cache_short_edge，不再是原图。
+  #      默认 768 是「小脸召回率」与「缓存体积/编码耗时」的折中
+  #      （263k 张唯一照片 × 约 90KB ≈ 24GB，NVMe 预算 300GB）。
+  #      要满分辨率检脸：把它调大（如 1600）后重跑 03_extract.py 与 06/07。
+  fuse_photo_pipeline: true
+  photo_cache_enabled: true
+
+dedup:
+  # L2a：pHash 感知哈希去重（仅图片）
+  hash_size: 8                   # 64 bit
+  hamming_threshold: 8           # 汉明距离 <= 8 视为近重复
+  keep_policy: higher_res_newer_mtime
+
+video:
+  # L2b：镜头切分与抽帧（精度天花板）
+  #
+  # 切分后端（方案 D，2026-10 实测选定）：
+  #   ffmpeg      —— 用 ffmpeg 的 scdet 滤镜单遍解码切分（默认，推荐）
+  #   scenedetect —— 保留 PySceneDetect 作为回退
+  # 实测（同批真实视频，587s / 243s / 76s 各一段）：
+  #   PySceneDetect  16.08s / 13.84s / 12.19s
+  #   ffmpeg scdet    9.23s /  7.95s /  3.39s  → 约 2.1x
+  # 抽帧耗时两者相同（瓶颈是解码，不是切分）。
+  # CUDA 解码这两处都不可用/更慢（scdet 10.97s vs 9.23s；抽帧报
+  # "Impossible to convert between formats"），故不启用。
+  scene_detect_backend: ffmpeg
+  # PySceneDetect 阈值（0~255 内容差分尺度）
+  scene_detect_threshold: 30.0
+  # ffmpeg scdet 阈值（0~100 尺度）。实测校准：scdet=10 与
+  # ContentDetector(threshold=30) 切点数最接近（44 vs 41，比值 1.07）；
+  # scdet=5 → 2.9x 过多，scdet=15 → 0.59x 过少。
+  scdet_threshold: 10.0
+  min_shot_len_sec: 0.8
+  max_frames_per_shot: 5
+  long_shot_threshold_sec: 10.0
+  long_shot_sample_per_sec: 1.0
+  shot_boundary_force_split_sec: 1800.0   # 单镜头超 30 分钟强制按 5 分钟切段
+  force_split_sec: 300.0
+  # 末尾安全余量（秒）：容器 duration 常大于实际末帧 PTS，seek 到末尾会
+  # 「没有帧到达编码器」→ ffmpeg 报 Non full-range YUV 等次生错误。
+  # 实测 15 个真实视频：ts=时长 全部失败；时长-1 → 14/15；时长-5 → 15/15。
+  end_margin_sec: 5.0
+  min_frame_bytes: 2048                   # 抽帧后校验文件大小 > 2KB
+  min_frame_mean: 2.0                     # 非全黑（均值 > 2；夜景素材需放宽，原 5.0 过严）
+  frame_retry: 1
+  # 镜头数异常告警区间（每小时镜头数）
+  warn_shots_per_hour_low: 30
+  warn_shots_per_hour_high: 600
+  # 解码与背压
+  per_worker_reserve_mb: 300
+  max_worker_cap: 8
+  single_video_timeout_sec: 600           # 单视频 10 分钟超时
+  hwaccel: none                           # 不启用硬解，原因见下（勿随意改回 auto/cuda）
+  # 为什么默认 none（2026-10 实测）：
+  #   * 瓶颈是「镜头切分那一遍解码」，不是抽帧那一帧；硬解对总耗时无实测收益
+  #   * `-hwaccel cuda` 配合 scale 滤镜会报
+  #     "Impossible to convert between formats supported by the filter 'graph 0 input'"
+  #     → extract_frame 每次都白付一次失败尝试再回退软解（结果正确但更慢）
+  #   * 曾经的 "auto" 是无效值：代码只在 == "cuda" 时才生效，写 auto 等于从不开硬解
+  # 若将来要试硬解，请先跑 tests 里的对比，确认有收益再改
+
+exif:
+  # 拍摄时间优先级（规格 8.2 / 已拍板决策 ⑧）
+  priority: [exif_datetime_original, quicktime_creation_time, filename_date, mtime]
+
+semantic:
+  # L2c：唯一在线语义模型（已拍板：CLIP 被淘汰，不安装）
+  model_path: "${project_root}/weight/Qwen3-VL-Embedding-2B"
+  offline_only: true
+  dimension: 2048
+  mrl_dim: null                  # 非 null 时输出截断并重新归一化的向量（64~2048）
+  dtype: bfloat16
+  batch_size: 16                 # 规格已修正为 16；成组后这才是**真正生效**的前向批大小
+  # 跨文件成组大小（2026-10-16 新增，全集 ETA 的关键）
+  #
+  # 为什么需要：照片只有 1 帧，而原实现是「一个文件一次 encode_images」，
+  # 于是照片实际跑的是 batch=1 前向 —— batch_size: 16 对照片从未生效。
+  # batch=1 时 GPU 是延迟瓶颈（利用率 65%，3 个进程互相切上下文也只有 3.59 张/秒，
+  # 而 GPU 已 99%：典型的「忙而无效」）。
+  # 成组后把 8 个文件的帧合成一次调用，实测能到 9.5 张/秒量级。
+  group_size: 8
+
+  # ---- L2d 重排序（Qwen3-VL-Reranker-2B，规格第五章 / 05_rerank.py）----
+  # 召回是双塔（快而粗），重排序是交叉编码（准而贵），放在召回之后、L4 聚合之前。
+  rerank_model_path: "${project_root}/weight/Qwen3-VL-Reranker-2B"
+  rerank_dtype: bfloat16
+  rerank_batch_size: 8           # 批量打分；vendored 的 process() 是逐条的，本模块自己批量
+  rerank_cache_size: 4096        # (查询,文档) 分数 LRU 缓存条数，重复检索不再重复前向
+  # 指令：默认取权重目录的默认值（qwen3_vl_reranker.py::default_instruction）
+  rerank_instruct: "Given a search query, retrieve relevant candidates that answer the query."
+  # 图像像素预算：留空则用 checkpoint 默认（1280*32*32 ≈ 1.31MP）。
+  # 与语义编码同理，这是吞吐的主要旋钮；改小会改变分数，但不影响入库向量
+  # （重排序只作用于查询期，不动库），所以比改 semantic.max_pixels 安全得多。
+  rerank_max_pixels: null
+  # instruction 仅注入 query 侧；入库侧禁止拼 instruction
+  instruct_query: "检索与输入画面内容相似的视频片段"
+  instruct_doc: "Represent the user's image content for retrieval."
+  thresh_default: 0.55
+  recall_k: 400
+  # ⚠️ 重排的输入/输出条数不在这里，而在下方 retrieval.rerank_input_k / rerank_topk。
+  #    2026-10-16 删掉了这里原本重复的一行 `rerank_topk: 50`：
+  #    代码只读 retrieval.rerank_topk，留在这一段等于**假配置**
+  #    （改它不会起任何作用，还会让人以为改对了）。一个旋钮只能有一个真相源。
+  collection: materials_semantic
+
+faces:
+  # F0 采样策略（已拍板：A 方案稠密预计算）
+  #
+  # ⚠️ 实现现状（2026-10-16）：sample_fps / min_per_shot / max_per_shot 目前**不生效**。
+  #    F1（06_face_detect.py）直接复用 03_extract.py 已抽出的关键帧
+  #    （每镜头 ≤ video.max_frames_per_shot 张），以满足规格「F1 直接读 L2b 产物，
+  #    绝不重新解码视频」这条硬约束；代价是采样密度低于 F0 的纸面值。
+  #    要真正稠密采样，把 video.max_frames_per_shot /
+  #    video.long_shot_sample_per_sec 调大后重跑 03_extract.py 即可，
+  #    06/07 无需改动。照片侧不受影响（照片本来就只有一帧）。
+  mode: dense_precompute
+  sample_fps: 1.0
+  min_per_shot: 3
+  max_per_shot: 60
+  always_include_shot_boundaries: true
+  skip_if_shot_shorter_than_sec: 0.5
+  # F1 检测与对齐（显式路径加载，绝不依赖 FaceAnalysis 自动查找 / 联网下载）
+  pack: buffalo_l
+  det_onnx: "${project_root}/weight/buffalo_l/det_10g.onnx"
+  rec_onnx: "${project_root}/weight/buffalo_l/w600k_r50.onnx"
+  landmark_2d_onnx: "${project_root}/weight/buffalo_l/2d106det.onnx"
+  det_size: [512, 512]
+  det_thresh: 0.5
+  nms_thresh: 0.4
+  input_size: [112, 112]
+  # 质量分（规格 F2）清晰度项的归一化尺度：
+  #   sharp = min(1, sqrt(lap_var / quality_lap_norm))
+  # 原实现写死 lap_var/500 且不开方，在真实 384px 关键帧上实测人脸 quality
+  # 中位数只有 0.2179 —— 于是默认 min_quality=0.3 会把 2/3 的人脸挡在墙外。
+  # 150 + 开方压缩后中位数升到 0.5 附近，min_quality=0.3 只过滤真正糊/小的脸。
+  quality_lap_norm: 150.0
+  quality_min_show: 0.3           # 照片墙「质量 ≥」滑块的默认值
+  # F2 track 去重
+  track_iou_threshold: 0.5
+  track_cosine_threshold: 0.85
+  track_keep_per_track: 2        # 每条 track 只保留 1~2 张代表帧
+  adjacent_track_merge_cosine: 0.85
+  # 同一文件最多保留的人脸数（防御性上限，防海报/合影把库撑爆）
+  max_faces_per_file: 400
+  # F3 编码入库
+  dimension: 512
+  score_thresh: 0.55             # 检索阈值固定 0.55~0.60
+  collection: materials_faces
+  # 展示层独立过滤（零训练成本）
+  group_poster_face_count: 15    # 单张照片检出 > 15 张脸 → kind_hint=group_poster
+  wall_min_face_short_edge: 48   # 人脸短边 < 48px 不进墙（仍入库参与检索）
+  burst_cosine: 0.90
+  burst_count: 50                # 同文件内 > 50 张 cosine>0.9 → 只留代表帧
+
+retrieval:
+  # 7.2 自适应截断
+  k_hard: 200
+  gap_min: 0.03
+  # ⚠️ min_score 必须按**模型实际分数空间**标定，规格写的 0.55 在本项目是错的。
+  # 2026-10-16 实测（18,506 个向量，9 个查询，k=400）：
+  #   Qwen3-VL-Embedding-2B 的文字→图片余弦整体挤在 0.31~0.50：
+  #     全部查询合并 p99=0.451  p90=0.419  p50=0.366  最大仅 0.497
+  #   甚至一个**故意编的无关查询词**（"完全无关的查询词xyzzy"）最高分也有 0.405。
+  #   ⇒ min_score=0.55 高于模型能给出的最高分 → 自适应截断永远返回 0 条，
+  #     现象就是「搜什么都空」（这是原有实现的真实故障，不是调参口味问题）。
+  #   ⇒ 绝对余弦在这个模型上几乎不能区分相关与无关，所以召回侧只做**宽松兜底**，
+  #     真正的相关性判别交给 L2d 重排序（交叉编码，自检里相关 0.547 / 无关 0.195）。
+  # 0.30 取得比「疑似相关」的 p10（0.3125）还低一点，只用来滤掉明显噪声；
+  # 想更严就调大，但**别超过 0.45**（那会把所有查询都砍空）。
+  min_score: 0.30
+  # L4 时序一致性聚类
+  temporal_merge_gap_sec: 3.0
+  # 多向量 OR 融合
+  fusion: rrf
+  rrf_k: 60
+  # 文字检索鲁棒性：query 侧轻量改写
+  query_prefix: "视频中，"
+  query_rewrite_enabled: true
+
+  # ---- L2d 重排序（2026-10-16 启用，Qwen3-VL-Reranker-2B）----
+  #
+  # 顺序是「召回 → **重排** → 截断」，不是「召回 → 截断 → 重排」：
+  # 召回余弦在这个模型上区分度太低（见上面 min_score 的实测），
+  # 若先按阈值截断，重排就没有候选可排了 —— 实测会把所有文字查询砍成 0 条。
+  #
+  # 规格第五章写的是「k=400 → Top-50」。**默认只重排 60 条**，原因：
+  # 重排是交叉编码（查询+素材拼成一条序列过一次 2B），比双塔召回贵两个数量级。
+  # 想按规格跑满就设成 400（`05_rerank.py --k 400` 也能这么跑并打印耗时）。
+  rerank_enabled: true
+  rerank_input_k: 60             # 重排前多少条召回结果（规格：400）
+  rerank_topk: 50                # 规格 8.2：重排后保留 Top-50
+  # 重排分空间的阈值。实测重排分 0.14~0.51（p90=0.459 p75=0.427 p10=0.222），
+  # 且**能区分**相关/无关，所以这里用绝对阈值才有意义：0.25 约等于 p15，
+  # 只滤掉明显无关的，保留大部分。
+  rerank_min_score: 0.25
+  # 近重复/精确匹配护航：最高召回余弦 >= 此值时**跳过重排序**，保留召回顺序。
+  # 召回余弦的正常区间是 0.31~0.50（见上面 min_score 的实测），所以 >=0.85
+  # 只可能意味着「库里就有这张图/这段画面」。
+  # 为什么必须跳过：交叉编码器给的是绝对 yes 概率（实测自我匹配只有 0.789），
+  # 比余弦低，重排反而会把精确匹配压下去、还白花 8~12 秒。
+  rerank_skip_cosine: 0.85
+
+ui:
+  host: 127.0.0.1
+  port: 8501
+  static_port: 18501
+  page_size: 60                  # keyset 分页一次 <= 60 条（LIMIT 61 探测下一页）
+  fetch_limit: 61
+  overview_cosine: 0.85          # 概览模式局部向量去重阈值
+  preview_max_px: 1280
+  bind_localhost_only: true      # 禁止 0.0.0.0
+  # 安全加固：/media 下只允许「库中已索引且未标 missing」的文件。
+  # 作用：即使 media_root 被设成整个盘根（如 E:\），也不会把整盘暴露给浏览器。
+  restrict_static_to_indexed: true
+  # 概览模式的向量去重是否走 Qdrant（规格 8.2 要求 Qdrant 只在 [找同款] 时调用，
+  # 故默认 false；置 true 会让照片墙去重更准，但每次翻页都会查向量库）
+  overview_use_qdrant: false
+
+qdrant:
+  # 规格硬写 6333；本机 Windows Hyper-V 保留了 6313-6412 端口段（实测 6333/6334
+  # 均 bind 失败），用户 2026-10 拍板改用 7333。修好 winnat 后可原位改回。
+  url: "http://127.0.0.1:7333"
+  prefer_grpc: false
+  timeout_sec: 30
+  hnsw_m: 16
+  hnsw_ef_construct: 128
+  on_disk_payload: false
+  quantization: int8             # 规格：向量 int8 量化入库
+
+ffmpeg:
+  bin: "${project_root}/bin/ffmpeg.exe"
+  probe: "${project_root}/bin/ffprobe.exe"
+  # 若 bin/ 下不存在，自动回落到 PATH 上的 ffmpeg（本机已装 9.0.1），并在 bootstrap 里报告
+  fallback_to_path: true
+
+export:
+  encoding: utf-8-sig            # TSV 唯一需要偏离纯 UTF-8 的地方（Excel 中文）
+  delimiter: "\t"
+  relative_default: false
+  columns: [kind, abs_path, shot_start_ms, shot_end_ms, face_id, score, thumb_path, path_status]
+
+logging:
+  level: INFO
+  date_format: "%Y-%m-%d %H:%M:%S"
+  double_write: true             # stdout + logs/<date>.log
+  log_paths_quoted: true         # 隐私红线：日志中路径做 quote 显示
+
+privacy:
+  faces_local_only: true
+  exclude_face_crop_from_export: true   # 导出 TSV 默认排除人脸裁剪图路径
+  log_face_vectors: false               # 日志只记 face_id，不记向量与原图
+  disable_on_remote: true               # 远程访问时关静态服务 + 关照片墙 + 关人脸检索
+
+# =============================================================================
+# v5.3 新增：人脸自动分组（规格 §6）
+# 参数是「起点」而不是拍板值：规格要求先用 10 万样本试跑、看内存与耗时，
+# 再用金标准集（17_gold.py）验证。下面的数就是规格 §6.2 给的起点。
+# =============================================================================
+cluster:
+  enabled: true
+  # 只有 quality >= 这个门槛的人脸参与聚类（噪声脸会把簇拉散）
+  quality_gate: 0.3
+  umap_n_neighbors: 15
+  umap_n_components: 20
+  umap_min_dist: 0.0
+  hdbscan_min_cluster_size: 3
+  hdbscan_min_samples: 2
+  hdbscan_cluster_selection_epsilon: 0.15
+  hdbscan_cluster_selection_method: leaf
+  # 试跑样本量：先在这里的数字上量内存峰值，再线性外推到全量（规格 §6.3 硬约束）
+  trial_sample: 100000
+  # 簇内平均相似度低于这个值 → 标为「待审核」（规格 §15.7）
+  low_confidence_threshold: 0.45
+  keep_versions: 3              # 保留最近几个版本，超出的自动清最旧
+  # 金标准集目录：一个子文件夹=一个人，_ 开头的文件夹忽略（规格 §7.4.1）
+  gold_root: ""
+
+# =============================================================================
+# v5.3 新增：缩略图缓存（规格 §7.1 策略 B：按需生成 + LRU，空间自限）
+# 缓存键用 content_hash 而不是路径：搬家/改路径不影响命中率。
+# =============================================================================
+cache:
+  enabled: true
+  # 上限取「NVMe 余量的 60%」与这个绝对值中较小的一个
+  max_gb: 50
+  thumb_px: 320
+  thumb_quality: 80
+  evict_batch: 2000             # 低峰期每次最多删多少个文件
+  warn_ratio: 0.8
+  stop_write_ratio: 0.9
+
+# =============================================================================
+# v5.3 新增：日志与告警（规格 §15.5 默认实现：本地轮转 + 界面角标 + 可配 webhook）
+# =============================================================================
+monitor:
+  webhook_url: ""               # 留空=关闭；填 HTTP 地址则严重错误时 POST 一条 JSON
+  alert_on_error: true          # err 日志非零就在界面右上角显示角标
+  rotate_max_mb: 100            # 单个日志文件上限
+  rotate_keep: 10               # 保留最近几个
+  metrics_enabled: false        # 预留 /metrics（Prometheus 文本格式）
+
+# =============================================================================
+# v5.3 新增：历史数据回填（规格 §10）
+# =============================================================================
+backfill:
+  batch_files: 5000             # 每批 <= 5000 个文件（规格 §15.4 强制）
+  dry_run_default: true         # 默认只出计划，不执行

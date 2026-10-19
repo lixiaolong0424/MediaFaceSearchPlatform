@@ -1,0 +1,55 @@
+============================================================================
+  素材人脸检索系统
+  项目根目录 : D:\DATA\PROJECT\建设多媒体整理系统
+============================================================================
+
+[1/3] 启动自检...
+2026-10-15 17:12:05 | INFO    | 20261015-171205-3df486 | bootstrap | 会话 20261015-171205-3df486 启动自检开始（project_root="D:\DATA\PROJECT\建设多媒体整理系统," media_root="E:\）"
+
+========================================================================================
+  启动自检报告  (session=20261015-171205-3df486)
+========================================================================================
+✅ [OK  ] Python >= 3.10 且非 Store 版                3.12.14 @ D:\DATA\PROJECT\建设多媒体整理系统\.venv\Scripts\python.exe
+✅ [OK  ] torch + CUDA 可用                          torch 2.8.0+cu126 / cuda 12.6 / available=True / NVIDIA GeForce RTX 3090
+✅ [OK  ] onnxruntime 未被 CPU 版抢占                   仅 ['onnxruntime-gpu']
+✅ [OK  ] onnxruntime-gpu + CUDAExecutionProvider  onnxruntime 1.20.2 / providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+⚠️  [WARN] ffmpeg.exe / ffprobe.exe 可达              ffprobe version 9.0.1-essentials_build-www.gyan.dev Copyright (c) 2007-2026 the FFmpeg developers（config 指定 D:/DATA/PROJECT/建设多媒体整理系统/bin/ffmpeg.exe 不存在，已回退 PATH：D:\PROGRAM\1_ffmpeg-9.0.1-essentials_build\bin\ffmpeg.EXE）
+           ↳ 建议把 ffmpeg.exe/ffprobe.exe 复制到 D:\DATA\PROJECT\建设多媒体整理系统\bin，避免 PATH 变化后失效
+✅ [OK  ] 长路径已启用（LongPathsEnabled=1）               1
+✅ [OK  ] media_root 存在且可读                         E:\（可列出目录）
+⚠️  [WARN] media_root 不是整个盘根                        当前为 E:\（整个盘根目录）
+           ↳ 规格建议：在 UI 首次启动时提示指定具体子目录（如 E:\晚上），可大幅提升扫描效率并减少误报
+✅ [OK  ] project_root 可写可创建子目录                    D:\DATA\PROJECT\建设多媒体整理系统
+✅ [OK  ] nvme/thumbs/frames/db/tmp 可写可删           D:\DATA\PROJECT\建设多媒体整理系统\data\nvme（新建 0 个子目录）
+✅ [OK  ] 剩余空间 >= 30GB（nvme_root）                  1915.8 GB 可用 / 共 3815 GB
+✅ [OK  ] 剩余空间 >= 30GB（project_root）               1915.8 GB 可用 / 共 3815 GB
+✅ [OK  ] sqlite WAL 可用                            library.db journal_mode=wal
+❌ [FAIL] 端口 8501 可用（Streamlit UI）                 bind 失败：[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。
+           ↳ netstat -ano | findstr :8501  找到占用进程后 taskkill /PID <pid> /F，或修改 config.yaml
+✅ [OK  ] 端口 18501 可用（静态服务）                        bind 成功
+✅ [OK  ] Qdrant 容器可连                              http://127.0.0.1:7333 → {"result":{"collections":[{"name":"materials_semantic"}]},"status":"ok","time":4
+✅ [OK  ] Python 依赖                                9 个模块可导入
+✅ [OK  ] 权重离线可用（Qwen3-VL-Embedding-2B）            D:\DATA\PROJECT\建设多媒体整理系统\weight\Qwen3-VL-Embedding-2B（safetensors 4.0 GB）
+✅ [OK  ] 权重离线可用（insightface buffalo_l）            D:\DATA\PROJECT\建设多媒体整理系统\weight\buffalo_l（3 个必需 onnx 齐备，det=16.1 MB rec=166.3 MB，附带 1k3d68.onnx(3D68 附带), genderage.onnx(性别年龄，不使用但别删)）
+? [   1] 人脸识别模型输出维度 = 512                         w600k_r50.onnx：1 个输出，末维 = 512 ✓
+? [   1] 人脸检测模型结构（SCRFD 多尺度输出）                    det_10g.onnx：9 个输出 / 158 节点 / 4.23M 参数
+✅ [OK  ] onnxruntime 复用 torch 的 CUDA/cuDNN DLL    该版本 onnxruntime 无 preload_dlls()，改用 import torch → 已 import torch 预加载
+✅ [OK  ] 人脸模型实际推理 provider                        实际 providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+✅ [OK  ] 库所在盘有稳定 inode                            st_ino 可用
+⚠️  [WARN] Defender 排除项                             未排除 3 项
+           ↳ 管理员 PowerShell 执行：
+           ↳   Add-MpPreference -ExclusionPath 'D:\DATA\PROJECT\建设多媒体整理系统\data\nvme','D:\DATA\PROJECT\建设多媒体整理系统\.venv','D:\DATA\PROJECT\建设多媒体整理系统\tmp'
+           ↳ 建议排除：D:\DATA\PROJECT\建设多媒体整理系统\data\nvme，D:\DATA\PROJECT\建设多媒体整理系统\.venv，D:\DATA\PROJECT\建设多媒体整理系统\tmp
+✅ [OK  ] 目录 ACL 继承（替代 umask）                      含 (OI)(CI) 继承标记
+----------------------------------------------------------------------------------------
+  通过 20 / 警告 3 / 失败 1
+========================================================================================
+
+❌ 存在必须修复的项，已中止。请按上面 ↳ 提示处理后重跑：
+   .venv\Scripts\python.exe 00_bootstrap.py
+
+
+[中止] 自检未通过。请按上面的提示修复后重试。
+
+
+Press any key to continue . . . 

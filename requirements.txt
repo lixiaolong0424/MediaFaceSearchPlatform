@@ -1,0 +1,50 @@
+# 素材人脸检索系统 · Python 依赖（P0 实际验证通过的版本）
+#
+# 安装要点（详见 README §3）：
+#   1. torch / torchvision 必须走 PyTorch 官方 CUDA 12.6 索引。国内镜像常挂死，
+#      推荐 curl -C - 断点续传下 wheel 后本地安装（脚本：tmp/setup_venv4.ps1）。
+#   2. onnxruntime-gpu **必须锁 1.20.2**：
+#      * >=1.21 的 PyPI wheel 是 CUDA 12.8 构建，与本机 torch cu126（CUDA 12.6）不兼容
+#        （实测报 cublasLt64_13.dll missing，会话静默回退 CPU）；
+#      * >=1.27 默认 CUDA 13.0 构建，问题更直接；
+#      * 1.20.x 是官方文档标明的「CUDA 12.x / cuDNN 9.x」构建，与 torch 2.8.0+cu126 匹配。
+#   3. insightface 会把 **CPU 版 onnxruntime** 作为依赖装回来。安装完必须执行
+#        pip uninstall -y onnxruntime
+#      否则 CPU 版抢占命名空间，CUDAExecutionProvider 会消失（规格点名的坑）。
+#   4. transformers 需 >=4.57.0（Qwen3-VL 的 modeling / processor）；
+#      qwen-vl-utils 是权重目录自带 qwen3_vl_embedding.py 的硬依赖。
+
+# --- 深度学习运行时（CUDA 12.6） ---
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+
+# --- ONNX 推理（人脸管线，必须 GPU 版且锁 1.20.x） ---
+onnxruntime-gpu==1.20.2
+insightface==2.1
+
+# --- 语义编码模型栈 ---
+transformers==4.57.1
+sentence-transformers==5.7.0
+qwen-vl-utils==0.0.14
+accelerate==1.15.0
+safetensors==0.8.0
+
+# --- 向量库 ---
+qdrant-client==1.19.1
+
+# --- 视频 / 图像处理 ---
+scenedetect==0.7.2
+opencv-python-headless==5.0.0.93
+pillow==12.3.0
+imagehash==4.3.2
+numpy==2.2.6
+
+# --- Web UI 与系统 ---
+streamlit==1.66.0
+psutil==7.2.2
+
+# --- 配置 ---
+PyYAML==6.0.3
+
+# --- 仅自检脚本使用（可选） ---
+onnx==1.23.2          # 00_bootstrap.py 的 ONNX 图结构校验；缺失时该项自动跳过

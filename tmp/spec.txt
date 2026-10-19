@@ -1,0 +1,445 @@
+素材人脸检索系统 · 完整实施规格 v2.0（Windows 版）
+
+〇、Agent 工作方式（最重要，先读）
+你是本项目的唯一实现者。目标不是「写一堆 py 文件」，而是交付一个可安装、可扫描、可检索、可导出、可验收的本地工具。请遵守以下工作纪律：
+1. 不许并行阶段。 P0 未通过验收前，禁止写 P2 的人脸管线代码；schema 未冻结前，禁止写业务逻辑。每完成一个阶段，先跑验收用例，全部通过后向我汇报再进入下一阶段。
+2. 每个模块必须可独立运行。 每个 .py 都要支持 --dry-run、--shard N/M、--root <path>。单文件失败只写 error 字段，绝不中断整批。
+3. 所有路径用 pathlib.Path，禁止字符串拼接。 全程使用绝对路径。日志双写 stdout 与 ./logs/<date>.log，每条日志带 session_id。
+4. 参数一律进 config.yaml，禁止硬编码。 阈值、采样率、分页大小、预算上限，一处定义，全局读取。
+5. 遇到规格未覆盖的边界情况，先问我，不要自行决定。 尤其涉及：默认阈值、抽帧密度、删除策略、隐私开关。
+6. 每次交付物必须附带：可执行的验收命令 + 预期输出 + 失败判定标准。 没有验收标准的代码视为未完成。
+7. 先输出实施计划（拆成若干 milestone，每个 milestone 列出产出文件与验收方式），经我确认后再动手写代码。
+
+一、项目概览
+1.1 目标（必须全部做到）
+用户指定一个或多个本地绝对路径，递归扫描其中的照片与视频，建立离线索引。
+支持三种检索输入：文字描述 / 图片 / 视频；图片与视频输入时可勾选「精确找人」。
+Tab1 照片墙：把该目录下检测到的所有人脸铺成可筛选、可分页、可滚动的瀑布流（浏览模式，不依赖任何 query）。
+Tab2 命中清单：一次检索的命中结果，带时间码（视频）或日期（照片）、完整绝对路径、相似度 badge。
+卡片支持：▶ 预览（视频从指定时间点片段播放）、📂 打开所在文件夹（按钮，非右键）、找同款（人脸向量召回）。
+导出 TSV：三入口（全库清单 / 当前照片墙筛选结果 / 命中清单），tab 分隔、存在性校验（DEAD 标记）、幂等排序。
+增量扫描：只处理新增/修改/移动的文件；扫描异步、可见进度、不阻塞浏览。
+1.2 明确不做（写死，防 scope creep）
+人物自动聚类分人 UI、人名管理、社交分享、地图相册、手机备份、云同步。
+视频转码、语音识别、字幕理解、车牌/身份证识别。
+浏览器内剪辑或时间轴编辑器（交付物是「时间点+路径+TSV」，剪辑交下游）。
+多人脸合照的矩形框选指定某人（靠「点脸→找同款」解决）。
+结构化 TXT 供下游 agent 剪辑归档。
+依赖 Immich 或任何外部相册系统的数据库与 API。
+Docker 部署主应用（Qdrant 除外）。
+1.3 运行环境（Windows 硬约束）
+目标平台：Windows 10/11 22H2+，x86_64，裸机，无 Docker（Qdrant 除外）
+Python：3.10+（python.org 安装包，禁止 Microsoft Store 版——其 KnownFolder 重定向会破坏相对路径）
+GPU：NVIDIA RTX 3090 24GB，驱动 ≥55x，CUDA 由 torch 轮子自带（pip install torch --index-url https://download.pytorch.org/whl/cu126）
+onnxruntime：必须安装 onnxruntime-gpu（非 CPU 版），确认 ort.get_available_providers() 包含 CUDAExecutionProvider。注意：新版 onnxruntime（≥1.23）已移除 ort.get_device()，需用 ort.get_available_providers() 替代。
+项目根目录：D:\DATA\PROJECT\建设多媒体整理系统（所有代码、日志、数据库、缓存、导出物均在此目录下）。素材根目录（media_root）：由用户在 UI 或 config.yaml 中指定，默认 E:\（用户可指定任意目录，代码中一律通过 config.yaml 的 media_root 读取，禁止硬编码）。
+
+项目根目录（project_root）：D:\DATA\PROJECT\建设多媒体整理系统（所有代码、日志、数据库、缓存、导出物均在此目录下）；派生物与索引目录：${project_root}\data\nvme，硬上限 300GB
+权重目录：${project_root}\weights（若权重在中文路径下，用 mklink 映射到此处）
+进程：用户登录会话内常驻（不用 Windows 服务），start.bat 双击启动，任务计划程序做定时增量扫描
+终端：PowerShell 5.1/7 + cmd 兼容；所有脚本支持 python xx.py --root "${media_root}"
+Qdrant：Docker 容器运行（docker.m.daocloud.io/qdrant/qdrant:latest 镜像拉取），绑定 127.0.0.1:6333
+环境变量：PYTHONUTF8=1（全局启用 UTF-8 模式，防止中文路径乱码）；TMP/TEMP/TMPDIR 指向 ${project_root}\tmp（建议指向 NVMe 分区以避免 C 盘空间不足）
+为什么不用 Windows 服务跑 Streamlit： Session 0 隔离会让 explorer /select, 等桌面交互型 subprocess 静默失败或弹到不可见会话。正确做法是「start.bat 双击启动 + 开机启动文件夹快捷方式」，或用任务计划程序「登录时触发」。
+
+二、架构总览
+HDD ${media_root}  (用户指定，只读)        │        ├──► A. 语义管线 ──► Qdrant collection: materials_semantic        │      L1 五类清单 → L2a pHash去重 → L2b 镜头切分抽帧+EXIF        │      → L2c 多模态编码(int8) → L3 upsert → L4 聚合        │        └──► B. 人脸管线(A方案·稠密预计算) ──► Qdrant collection: materials_faces               F1 SCRFD检测(稠密采样) → F2 shot内track合并+代表帧优选               → F3 ArcFace 512维入库 + 同步写 faces/thumbs                          │                          ▼              C. sqlite(state.db) ◄── 照片墙唯一数据源（绝不用 Qdrant 刷墙）                          │        ┌─────────────────┴──────────────────┐        ▼                                    ▼   Tab1 照片墙(browse)              Tab2 命中清单(ask)   sqlite分页/筛选/概览去重          向量召回→L4→预览/打开文件夹/导出TSV        ▲                    [找同款]              │        └────────────── 头像反跳(URL param) ───────┘
+全系统只有两个耦合点，守住这两条任何一层可单独替换：
+frames/ 目录（F1 直接读 L2b 产物，绝不重新解码视频）。
+命名空间 point_id = (file_id << 20) | shot_ix，保证语义结果与人脸结果都能回退到同一「文件 + 时间段」。
+
+三、目录树与存储治理
+${project_root}  bin\                    ffmpeg.exe / ffprobe.exe  .venv\                  虚拟环境  config.yaml             唯一配置入口  app.py / streamlit_app.py  src/  data/  ├─ library.db            SQLite 主库  ├─ nvme/                 派生物与索引（nvme_root），硬上限 300GB  │  ├─ frames/            关键帧 JPEG，短边≥384px，<file_id>/<shot_ix>.jpg  【可再生·LRU淘汰】  │  ├─ thumbs/            素材缩略图 <file_id>_320.webp                     【永不淘汰】  │  ├─ faces/  │  │  ├─ raw/            人脸 112×112 jpg，<face_id>.jpg                   【永不淘汰】  │  │  └─ thumbs/         人脸墙 128 webp                                   【永不淘汰】  │  ├─ embeddings/        语义向量缓存（L2 输出）  │  └─ query_cache/       用户上传的检索临时图【24h 清理】  ├─ export/               TSV 导出、命中清单  ├─ logs/  ├─ weights/               本地权重  │  ├─ qwen/               Qwen3-VL-Embedding-2B  │  └─ buffalo_l/           InsightFace buffalo_l  └─ tmp/                   临时文件（建议指向 NVMe 分区）
+容量重算（A 方案，上限估算）：
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="auto" w:w="0"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">产物
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">单体
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">数量
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">合计
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">关键帧 JPEG 384px
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">50KB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">60 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 30 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">缩略图 webp
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">15KB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">35 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 5 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">人脸 raw 112×112
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">4KB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">300 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 12 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">人脸 thumb 128
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">1KB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">300 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 3 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">Qdrant semantic 2048 int8
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">—
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">60 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 3 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">Qdrant faces 512 int8
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">—
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">300 万
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 3~6 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">db + logs + 杂项
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">—
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">—
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">≈ 10 GB
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">合计
+
+
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">≈ 66~72 GB
+治理规则（必须实现）：
+nvme_budget_gb: 300 写死上限；frames/ 每日 LRU 清理（淘汰最近 N 天未被命中的关键帧）；thumbs 与 faces 永不淘汰。
+query_cache/ 按 session 分目录，启动时清理超过 24h 的文件。
+孤儿回收：reconcile 命令第二阶段找出 status=missing 超 30 天的记录，删其 thumb 后再物理删记录——必须手动触发 + 二次确认 + 先输出 dry-run 报告。
+配额告警：NVMe 使用 > 80% 时 banner 告警并暂停增量入库。
+
+四、数据模型与一致性
+4.1 schema（state.db，WAL 模式）
+PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;CREATE TABLE libraries (root TEXT PRIMARY KEY, last_scan TEXT, status TEXT, indexed_faces INTEGER DEFAULT 0);CREATE TABLE files (  file_id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, path_hash TEXT,  inode INTEGER, size INTEGER, mtime INTEGER,  kind TEXT CHECK(kind IN ('photo','video','unknown')),  status TEXT DEFAULT 'pending',  phash TEXT, captured_at TEXT, time_source TEXT, visible INTEGER DEFAULT 1,  kind_hint TEXT, indexed_at TEXT, updated_at TEXT);CREATE INDEX idx_files_status ON files(status);CREATE INDEX idx_files_inode ON files(inode);CREATE INDEX idx_files_path_hash ON files(path_hash);CREATE TABLE shots (file_id INTEGER, shot_ix INTEGER, shot_start REAL, shot_end REAL, n_frames INTEGER, PRIMARY KEY(file_id,shot_ix));CREATE TABLE file_encoding (  file_id INTEGER, model TEXT, status TEXT, n_frames INTEGER, error TEXT, encoded_at TEXT,  PRIMARY KEY(file_id, model));CREATE TABLE face_records (  face_id INTEGER PRIMARY KEY, file_id INTEGER, shot_ix INTEGER,  bbox TEXT, quality REAL, track_id INTEGER, thumb_path TEXT,  status TEXT DEFAULT 'alive', captured_at TEXT,  hidden INTEGER DEFAULT 0);CREATE INDEX idx_face_browse ON face_records(status, captured_at DESC);CREATE INDEX idx_face_file ON face_records(file_id, shot_ix);CREATE TABLE person_labels (face_group_id INTEGER, name TEXT, created_at TEXT);CREATE TABLE judgments (query_id TEXT, doc_id TEXT, rank INTEGER, score REAL, label INTEGER, at TEXT);CREATE TABLE dead_letter (file_id INTEGER, stage TEXT, attempt INTEGER, error TEXT, at TEXT);CREATE TABLE audit_log (who TEXT, at TEXT, what TEXT, before TEXT, after TEXT);CREATE TABLE db_version (v INTEGER PRIMARY KEY);
+4.2 三条铁律
+去重跳过的文件，必须在 file_encoding 里为每个模型各记一行 skipped_dup，否则统计数对不上。
+文件被删除只标 status=missing，绝不物理删记录；改名/移动通过 inode 判定，只更新 path，保留所有向量与人脸记录。
+两阶段入库保一致性：先写 file_encoding.status=pending → 写 Qdrant → 最后 status=done + encoded_at。检索 L4 只 join done 的文件。提供 repair（重试 pending/error ≤3 次，超限入死信表）与 reconcile（比对 sqlite 与 Qdrant point 数，输出差异报告）。
+4.3 schema 迁移（P0 前置条件）
+db_version 单行表 + migrations/001_init.sql 增量脚本，启动时顺序执行大于当前版本的脚本，包在一个事务里，失败回滚。规则：幂等、只增不改（不改列类型不删列）、带 down 注释。违反则第一次改 schema 即事故。
+
+五、A 语义管线 L1–L4
+L1 清单扫描：后缀白名单 .jpg .jpeg .png .webp .mp4 .mov .mkv .avi .m4v；stat 取 mtime/inode/size，path_hash=md5(相对路径)；维护轻量索引表 path_hash → (inode,mtime,size) 使增量比对秒级完成；输出五类 new / modified / moved / unchanged / missing。不解码、不读内容。
+L2a pHash 去重（仅图片）：64 位感知哈希，汉明距离 ≤8 视为近重复；保留分辨率更高、mtime 更新者；另一记 skipped_dup。
+L2b 镜头切分与抽帧（精度天花板）：
+video:  scene_detect_threshold: 30.0  min_shot_len_sec: 0.8  max_frames_per_shot: 5  keyframe_short_edge: 384  long_shot_threshold_sec: 10.0  long_shot_sample_per_sec: 1photo:  keyframe_short_edge: 384
+同阶段顺手读 EXIF：优先级 DateTimeOriginal(含GPS时区) → QuickTime Creation Time → 文件名日期 → mtime，落 captured_at + time_source。不可在渲染时实时读。
+失败处理：抽帧后校验文件大小>2KB 且非全黑（均值>5），失败记 error 重试 1 次；单文件失败绝不中断整批；镜头数异常告警（每小时镜头数超出 [30,600] 标 warn；单镜头超 30 分钟强制按 5 分钟切段）。
+L2c 编码（唯一在线语义模型）：
+semantic_model:  model_path: E:/weights/qwen3-vl-embedding-2b  offline_only: true  dimension: 2048  mrl_dim: null  dtype: bfloat16  batch_size: 16  instruct_query: "检索与输入画面内容相似的视频片段"  thresh_default: 0.55  recall_k: 400  rerank_topk: 50
+入库 payload 扁平化且禁放模型相关字段：kind,file_id,shot_ix,sec,shot_start,shot_end,path,thumb_path；upsert 语义。
+L4 后处理（永远挂，与模型无关）： 1. 文件级聚合 2. 时序一致性聚类（相邻且间隔<3s 的命中镜头合并为一个时间段） 3. 防长视频霸榜（排序依据 = 文件内命中镜头数 × 平均分） 4. 检索侧 face→shot 去重（同一 (file_id,shot_ix) 内多张人脸取最高分代表，卡片标注「该镜头内出现 N 次」） 5. 精排接入点 stage1 k=400 → stage2 Reranker Top-50 → stage3 L4
+
+六、B 人脸管线 F1–F3（A 方案·稠密预计算）
+选型理由（已拍板）：查询延迟从 2~10s 降至 80~250ms（约 20~50 倍），且是唯一能让 P3 聚类成立的路径。成本前置到索引期。
+人脸模型选型：InsightFace buffalo_l（SCRFD 检测 + ArcFace 识别）
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">文件名
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">作用
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">本项目是否用到
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">det_10g.onnx
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">SCRFD 人脸检测器（10G 浮点版）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">✅ F1 核心
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">w600k_r50.onnx
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">ArcFace（ResNet-50，WebFace600K 训练），输出 512 维
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">✅ F3 核心
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">2d106det.onnx
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">106 点 2D 对齐
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">✅ 用于质量评分
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">1k3d68.onnx
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">3D68 对齐
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⚠️ 附带
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">genderage.onnx
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">性别年龄估计
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">❌ 不用（但别删）
+权重路径：${project_root}\weights\buffalo_l（若原始权重在中文路径下，用 mklink 映射到此处）
+F0 采样策略（替代「逐帧」，必须量化）：
+face_indexing:  mode: dense_precompute  sample_fps: 1.0  min_per_shot: 3  max_per_shot: 60  always_include_shot_boundaries: true  skip_if_shot_shorter_than_sec: 0.5
+关键解耦：检测密度 ≠ 存储增长。 扫 1fps 时同一镜头 30 帧经 F2 合并只存 1~2 张代表帧。瓶颈是 GPU 时间而非硬盘，故断点续跑必须扎实。
+F1 检测与对齐：
+face_model:  provider_root: E:/weights/insightface  pack: buffalo_l  det_size: [512,512]  det_thresh: 0.5  nms_thresh: 0.4  input_size: [112,112]
+对齐逻辑必须用模型自带，自己重写仿射变换会导致 embedding 失配。多图脸默认取面积最大者，其余保留带序号供前端点选。
+F2 shot 内 track 去重 —— correctness 关键路径，单独验收：
+同一 shot 内按时间序遍历：  IoU>0.5 或 外观cosine>0.85 → 合并为同一 track  每条 track 只保留 1~2 张代表帧  quality = 人脸像素面积 × 拉普拉斯清晰度 × 正面度 × det置信度  相邻 track cosine>0.85 再合并一次
+验收：取 10 段含人访谈视频（各 3~10 分钟），人工标定期望代表帧数；要求 F2 后每段输出 ≤ 期望值×1.5，且无连续时间戳相邻的代表帧（相邻间隔<1s 视为去重失败）。
+F3 编码入库：dim=512, distance=Cosine；payload file_id,shot_ix,bbox,quality,face_thumb_path；同步写出 faces/thumbs/<face_id>.webp（128×128，质量 80）——缺失则照片墙刷不出，绝不能事后补批处理。检索阈值固定 0.55~0.60。
+展示层独立过滤（零训练成本，已拍板）： - 单张照片检出 >15 张人脸 → 标 kind_hint=group_poster，墙上默认隐藏（可手动展开）。 - 人脸短边 <48px 不进墙（仍入库参与检索）。 - 同文件内 >50 张 cosine>0.9 的脸 → 判定视频抽帧/连拍，墙上只留代表帧。
+
+七、检索层
+7.1 路由真值表（UI 核心契约，不许自由发挥）
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">输入
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">精确找人 ☐
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">精确找人 ☑
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">文字
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">text encoder → materials_semantic
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">控件物理隐藏，提示「文字检索不支持人脸匹配」
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">图片/视频
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">visual encoder → semantic
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">抽帧检脸→点选→ArcFace → materials_faces；检不出脸则降级 semantic + 返回 warning 串
+硬规则： 1. 文字输入时开关必须物理隐藏，不能只是灰色。 2. 未检出人脸时明确提示并真的降级，不能报错卡死也不能静默切换。 3. 两种模式的分数绝不混排：语义标 sim=0.71，人脸标 face=0.84，不同颜色 badge。
+7.2 自适应截断（已拍板，替代固定阈值）
+召回 k=400 后按分数降序，在 top-50 内找最大 gap 做自然截断，阈值只做兜底：
+def adaptive_cut(scores, k_hard=200, min_score=0.55, gap_min=0.03):    top = scores[:min(k_hard, len(scores))]    for i in range(1, min(50, len(top))):        if top[i-1] - top[i] >= gap_min and top[i] >= min_score:            return top[:i]    return [s for s in top if s >= min_score]
+前端必须显示「已截断至 N 条（第 N+1 条分数 0.61）」。
+7.3 多向量 OR 融合
+合照点选多人时，用 RRF（倒数排名融合） 而非 max-score，并在卡片标注「命中原因：匹配到 3 张目标脸中的 2 张」。支持 -face_id 排除（RRF 合并时做差集）。
+7.4 文字检索鲁棒性
+query 侧轻量改写：自动补前缀「视频中，」、繁简转换、常见同义替换表；不做重量级重写。
+
+八、UI 契约（B/S，Streamlit + 本地静态服务）
+8.1 布局：双 Tab
+侧边栏：库路径[切换] / 增量扫描 / 全量扫描 / 状态数字 / NVMe 用量Tab1【照片墙】browse          Tab2【检索】ask 筛选栏 + 网格 + 分页            输入三态 + 精确找人 + 阈值 + 返回上限                                命中清单：关键帧+时间码+badge+操作栏Banner 常驻：模式 · 人脸库 N 张 · NVMe 已用 X/Y
+8.2 Tab1 照片墙
+默认「概览模式」（贪心局部向量去重：顺序扫描，与已选代表脸 cosine>0.85 则跳过；38k→~300 张，O(n)，内存只存代表脸向量）；二级「平铺模式」全量；P2「分组模式」软标签聚类。
+每张卡片：128 人脸缩略图 + 角标（视频显 mm:ss，照片显日期）+ hover 浮层（完整绝对路径 + quality + bbox）+ 三按钮 [▶ 预览] [找同款] [📂]。
+筛选：时间范围 / 来源文件 / 质量≥ / 排序（拍摄时间↓↑、质量↓、随机）/ 仅看本次新增。
+分页必须 keyset cursor：游标=(captured_at,face_id) 复合键，WHERE (captured_at,face_id)<(?,?) ORDER BY ... LIMIT 61。禁用 offset 深层翻页。
+数据源必须是 sqlite 分页，一次 ≤60 条；Qdrant 只在点 [找同款] 时才调用。
+8.3 Tab2 命中清单
+显示「命中 N 个镜头 / M 个文件」；排序默认按「文件内命中镜头数」降序，次级时间新→旧；人脸模式按相似度降序。
+顶部常驻搜索源提示（face_id=12847 [清除]），来自 URL param。
+空态：命中 0 时显示「未命中」+ 三条建议 + 当前阈值数字。
+8.4 互跳靠 URL 参数
+墙上点 [找同款] → st.query_params["face_id"]=12847 → 自动切 Tab2 跑人脸检索。
+结果里点头像 → st.query_params["highlight_face_id"]=12847 → 切回 Tab1 高亮。
+8.5 预览层
+点击 [▶ 预览] 展开区域：图片 st.image（上限 1280px）；视频 iframe 嵌入 <video controls src="/static/<rel>#t=起,止">；下方附「用本地播放器打开」按钮；人脸裁剪原图 + bbox 叠加 + 元数据表。
+8.6 空库与扫描态
+路径变更后，墙与检索入口置灰并显示原因：「该目录尚未建立索引，请先扫描」。
+扫描异步 + 进度可见，绝不阻塞页面。
+扫描期间允许浏览旧索引，常驻 banner 显示索引时效。
+人脸索引未完成时精确找人开关置灰，显示构建进度。
+
+九、三个底层能力（必须自己实现）
+9.1 跨平台打开所在文件夹（Windows 版）
+def open_containing_folder(abs_path: str) -> str:    """成功返回''，失败返回错误文案"""    from pathlib import Path    import subprocess    p = Path(abs_path).resolve()    if not p.exists():        return f"文件不存在：{abs_path}"    try:        # explorer /select, 逗号后无空格；整体 shell=True 兼容中文与特殊字符        subprocess.Popen(['explorer', '/select,' + str(p)], shell=True)        return ""    except Exception as e:        return f"打开文件夹失败：{e}"
+坑注：路径含 & 时绝不用 f-string 拼命令行；creationflags=CREATE_NO_WINDOW 防止 ffplay 弹控制台黑框。
+9.2 本地静态文件服务（片段预览前提，与 Streamlit 同进程子线程）
+绑定 127.0.0.1，禁止 0.0.0.0；根目录白名单仅 ${project_root}\data\nvme 与 ${media_root}；路径校验：
+root = Path("E:/nvme").resolve()p = (root / rel).resolve()if not str(p).startswith(str(root) + os.sep) and p != root:    raise web.HTTPForbidden()
+拒绝 .. 穿越；远程访问时整套静态服务 + 照片墙一起关掉。
+9.3 TSV 导出 + DEAD 校验 + 幂等
+必须 tab 分隔（文件名可能含逗号，CSV 会列错位）；首行写 UTF-8 BOM（\ufeff），这是 TSV 唯一需要偏离纯 UTF-8 的地方（否则 Excel 打开中文乱码）。
+列：kind\tabs_path\tshot_start_ms\tshot_end_ms\tface_id\tscore\tthumb_path\tpath_status
+按 path 排序保证幂等（同输入同输出）；导出前 os.path.exists 校验，失效标 DEAD，尾部汇总 # DEAD_PATHS；首行注释写 # scope=... 与 # exported_at=ISO8601 UTC；提供 --relative 开关输出相对路径。三入口不得混成一个按钮。
+
+十、增量扫描契约
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">事件
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">判定
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">处理
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">新增
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">inode 不在库
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">正常走 L2b→L2c→F1→F3
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">修改
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">inode 同但 mtime/size 变
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">原记录过期，重跑管线
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">移动/改名
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">inode 同但 path_hash 不同
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">只更新 path，保留所有向量与人脸记录
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">删除
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">库有但磁盘无
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">status=missing，软删
+inode 不稳定降级：启动时探测（os.link 试探 + 跨次 stat 比对），FAT/exFAT/NTFS 移动硬盘上不稳定 → 降级唯一键为 (path_hash, size, mtime_rounded_to_1s)，UI 常驻 banner 提示「该磁盘不支持 inode，文件移动会被视为新增」。
+并发与锁：批量提交每 500 文件一次；读连接独立只读、走 WAL snapshot；扫描与 Web 不用同一 db 句柄；入库期对单 file_id 行级锁，禁止全库写锁阻塞检索。
+背压与 OOM：推理侧单机信号量并发度=1（检索排队），torch.cuda.OutOfMemoryError 时 batch 减半重试一次；ffmpeg worker 按可用内存动态计算并发（每 worker 预留 300MB，上限=min(free//300MB, 核数)），单视频 10 分钟超时 + 内存上限（Windows 用 psutil 轮询 + taskkill /T /F 替代 resource.setrlimit）；前端扫描中检索显示排队提示。
+
+十一、启动自检 00_bootstrap.py（任一项 FAIL → 打印修复命令并 exit(1)）
+[必过] Python>=3.10 且非 Store 版 ｜ torch+CUDA 可用（torch.cuda.is_available()）[必过] onnxruntime-gpu 已安装且 CUDAExecutionProvider 可用（ort.get_available_providers()）[必过] ffmpeg.exe / ffprobe.exe 可达（ffprobe -version 通过）[必过] 长路径已启用（LongPathsEnabled=1）[必过] 库根可读且非 UNC、非 OneDrive、非系统盘[必过] nvme_root 可写可删（icacls 当前用户 FullControl）[必过] frames / thumbs / db / tmp 目录可写可删[必过] sqlite WAL 可用 ｜ 端口 8501/18501/6333 未被占（bind 探测）[必过] 剩余空间 >= 30GB ｜ 权重离线可用（${project_root}\weights，禁止无声下载 5GB）[必过] Qdrant 容器可连（curl http://127.0.0.1:6333/healthz）[必过] 库所在盘有稳定 inode（否则降级唯一键 + banner）[警告] Defender 排除项未配置 → 打印 Add-MpPreference 命令[警告] umask 无意义 → 改为检查目录 ACL 是否继承
+权重完整性检查： - Qwen3-VL-Embedding-2B：config.json + model.safetensors（单个>1GB，合计约4.3GB）+ tokenizer*.json；任一个 .safetensors <1MB 即 LFS 指针需重下 - buffalo_l：5 个 onnx 齐全且体积正常（det_10g>100MB, w600k_r50>100MB, 2d106det>10MB）[必过] project_root（${project_root}）可写可创建子目录（logs/、data/ 等）[必过] media_root 存在且可读（默认 E:\，若用户未改则检查 E:\）[必过] 权重目录 ${project_root}/weights/ 下 qwen/ 和 buffalo_l/ 可用（或 mklink 映射正常）
+
+十二、标注工具与验收基线
+命中清单每张卡片加 [相关]/[不相关] 按钮，点一下写入 judgments.tsv（TREC 风格：query_id Q0 doc_id rank score label）。先人工标 20 query × 每 query 前 50 命中，算 nDCG/P@20。这是调阈值、换模型的唯一依据，否则所有参数调整都是盲调。
+
+十三、模块清单与接口签名
+00_bootstrap.py   自检 + 权重离线加载 + inode 稳定性探测01_manifest.py    五类判定、path_hash/inode 改名识别、反向比对索引表02_dedup.py       pHash 汉明≤8，skipped_dup 落库03_extract.py     镜头切分抽帧 + EXIF/容器时间；--shard N/M 断点续跑04_encode.py      Qwen3-VL-Embedding-2B，instruction 仅 query 侧，int8 upsert05_rerank.py      Qwen3-VL-Reranker-2B：k=400 → Top-5006_face_detect.py SCRFD 稠密采样 + F2 track 合并 + 质量评分 + 代表帧优选07_face_encode.py ArcFace 512 + 同步写 faces/thumbs/<id>.webp08_search.py      三路路由 + 自动降级 + adaptive_cut + RRF + L4(shot去重/时序聚类/防霸榜)09_ui_wall.py     Tab1：face_wall_page 走 sqlite，keyset 分页，概览/平铺/分组10_ui_search.py   Tab2：输入三态 + 精确找人 + 命中清单 + 预览 + 打开文件夹11_export.py      三场景 TSV + DEAD 校验 + 幂等 + --relative12_maintain.py    增量 timer、repair、reconcile、LRU frames 清理、query_cache 清理、日志轮转、migratevector_store.py   抽象接口 upsert/search_knn/delete_by_file/count/reconcile（Qdrant 实现）static_serve.py   本地静态服务（鉴权白名单）sidebar.py        库管理共用组件config.yaml       全部参数集中
+核心签名：
+def face_wall_page(offset=0, limit=60, sort="captured_at_desc", t_start=None, t_end=None,                   file_id=None, min_quality=0.3, cursor=None) -> dict:    """{total, items:[...], facets:{files_count,date_range}}；cursor 优先于 offset"""def search(query_mode, payload, exact_person, thresh, k) -> tuple[list, warning_str]:    """exact_person=True 且无检出人脸 → 自动降级并返回 warning 串"""def open_containing_folder(abs_path: str) -> strdef export_tsv(rows, scope_label, out_path, relative=False) -> dict:  # {written, dead:[...]}
+
+十四、配置总表（config.yaml，禁止硬编码）
+project_root: "D:\DATA\PROJECT\建设多媒体整理系统"media_root: "E:\"          # 用户可指定，UI 启动时也可覆盖library:  root: ${media_root}  ext_whitelist: [jpg,jpeg,png,webp,mp4,mov,mkv,avi,m4v]storage:  nvme_root: ${project_root}/data/nvme  nvme_budget_gb: 300  frames_keep_policy: lru  keyframe_short_edge: 384db_path: ${project_root}/data/library.dbqdrant_url: http://127.0.0.1:6333weights:  insightface: ${project_root}/weights/buffalo_l  qwen: ${project_root}/weights/qwenffmpeg_bin: ${project_root}/bin/ffmpeg.exeffprobe_bin: ${project_root}/bin/ffprobe.execache_dir: ${project_root}/data/cacheexport_dir: ${project_root}/data/exportlog_dir: ${project_root}/logs
+
+十五、分阶段交付（不许并行）
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">阶段
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">交付
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">验收（逐条执行，一条不过即退回）
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">P0
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">00/01/02/03/04 + 语义检索 + 命中清单 + 打开文件夹 + 导出 TSV + bootstrap + migrations + vector_store 抽象
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">①20 个标准 query 标 judgment 集，记 P@20/nDCG 基线 ②路径含中文/空格/括号时 📂 正常生效（Win 一次）③视频 ▶ 预览从 shot_start 播而非从头 ④导出 TSV tab 分隔 + UTF-8 BOM；故意删 3 个源文件再导出，尾部 # DEAD_PATHS 数量正确 ⑤同批导出两次 diff 为空 ⑥扫描异步不假死，中途 Ctrl+C 后可续跑
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">P1
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">Reranker + 阈值分档校准 + adaptive_cut 前端提示
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">P@20 提升 ≥5 点；返回条数在不同 query 下不出现 0 或 3000 的极端抖动
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">P2
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">06/07 + 照片墙 Tab1（概览默认+平铺+分组by文件）+ [找同款] 闭环 + 海报过滤三条
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">①首屏 ≤800ms；翻到第 500 页不随页号变慢；进程内存稳定 ≤200MB ②F2 单独验收（10 段访谈，输出≤期望×1.5，无相邻代表帧）③未检脸正确降级并提示 ④墙上无电视海报脸
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">P3
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">增量 timer + moved/missing 处理 + repair/reconcile + LRU + 孤儿回收 + 配额告警 + 故障手册
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">无人值守跑一周不崩；NVMe ≤预算；reconcile 零差异；删 1 万张后 reconcile dry-run 报告正确
+P0 必须包含「打开所在文件夹」和「导出 TSV」——这是核心交付物，不得后移。
+
+十六、故障归因速查
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="3960"/><w:gridCol w:w="3960"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">现象
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">先查
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">搜什么都空
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">files.status 是否 done；collection 是否有点
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">搜得到但时间码错
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">shots 表 shot_start/end 与 ffmpeg 实际切帧是否一致
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">换模型后精度暴跌
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">是否忘清 file_encoding 致新旧向量混；instruction 是否误拼到入库侧
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">人脸检索全是陌生人
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">对齐逻辑被改过 / 阈值过高 / F2 未生效致库被重复帧污染
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">人脸检索全是同一个人重复
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">F2 track 去重没生效；检索侧 shot 级去重没挂
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">扫描巨慢
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">素材在 NAS；或未走增量把全库重解码；或未用反向比对索引表
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">NVMe 爆满
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">frames LRU 没配 cron；或 orphan 从未回收
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">照片墙缺图
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">faces/thumbs/ 未在 F3 同步写出，或 min_quality_show 过高
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">照片墙巨慢
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">误用 Qdrant scroll，应走 sqlite 分页
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">打开文件夹无反应
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">subprocess 传了 shell 字符串 / 路径特殊字符 / 网络盘
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">导出 TSV 列错位
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">用了逗号分隔 → 改 tab + 加 BOM
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">时间排序错乱
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">time_source=mtime 占比高 → EXIF 读取失败
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">首次启动卡住
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">权重在无声下载 5GB；或 NVMe 属主为 root
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">onnxruntime 走 CPU
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">装了 CPU 版 onnxruntime 而非 onnxruntime-gpu；或两者共存被抢占
+
+十七、隐私与安全红线
+人脸库只存本机 NVMe，不进云不上报。静态服务绑 127.0.0.1，远程访问时关静态服务 + 关照片墙 + 关人脸检索入口。
+照片墙是最直观的泄露面：visible/hidden 软标记；导出 TSV 默认排除人脸裁剪图路径；日志不记录人脸向量与原图，只记 face_id。
+umask 027；日志中的路径做 quote 显示。
+
+十八、已拍板决策（不得再改动）
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/><w:gridCol w:w="2640"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">#
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">决策
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">定案
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">①
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">精确找人抽帧
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">A 稠密预计算，1fps 封顶 + 每镜头上下限 + 镜头边界必采
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">②
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">照片墙默认视图
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">B 概览（局部去重）
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">③
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">阈值策略
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">B k 上限 + 自适应截断
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">④
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">过滤海报/电视脸
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">B 三条启发式
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⑤
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">thumb 清理时机
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">B soft 30 天 + reconcile 手动回收 + 配额告警
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⑥
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">架构
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">B/S：Streamlit + 本地静态服务 + 服务端 subprocess；「右键」降级为卡片按钮
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⑦
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">界面
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">双 Tab：Tab1 照片墙(browse) / Tab2 命中清单(ask)，互跳靠 URL params
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⑧
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">排序键
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">EXIF/容器时间 → 文件名日期 → mtime（不是 mtime）
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">⑨
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">部署
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">无 Docker 主应用；Qdrant 用 Docker 容器；start.bat 双击启动；systemd 替换为任务计划程序
+
+十九、Windows 特有 12 坑（照抄进规格）
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/><w:gridCol w:w="1980"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">#
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">坑
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">后果
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">规格写法
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">1
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">explorer /select, 语法
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">逗号后不能有空格；路径含 & , () 时必须整体双引号；shell=True 更稳
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">封装 open_containing_folder，失败返回文案而非抛异常
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">2
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">Session 0 隔离
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">服务态调用 explorer/ffplay 静默失效
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">UI 进程必须在用户登录会话
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">3
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">MAX_PATH 260 限制
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">深层目录 + 长文件名 → FileNotFoundError
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">自检：LongPathsEnabled=1；全程用 Path.absolute()
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">4
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">PYTHONUTF8=1
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">中文路径在 cp936 下 open() 乱码崩
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">全局环境变量 + 所有 open 显式 encoding="utf-8"
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">5
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">TMP 在 C 盘小分区
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">Streamlit 上传大图检索 → No space left
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">启动时设 TMP/TEMP/TMPDIR=E:\nvme\tmp，并清理
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">6
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">OneDrive 云占位符文件
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">看似在本地，读时触发下载或直接 0 字节
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">自检：库根若在 OneDrive\ 下则拒绝并提示
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">7
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">UNC 网络盘/NAS
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">速度慢 100 倍 + explorer 选中失效 + stat 不稳定
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">拒绝索引 UNC 路径，提示”请先 rsync/robocopy 到本地盘”
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">8
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">FAT/exFAT 移动硬盘无稳定 inode
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">增量扫描把改名当”删+新增”
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">降级唯一键为 (path_hash, size, mtime_rounded_1s) + banner 提示
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">9
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">无 os.fork / 无 setrlimit
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">resource.setrlimit 抛 AttributeError；mp 需 spawn
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">worker 改用子进程 + psutil 轮询内存 + 10 分钟超时 kill；所有 mp 代码包在 if __name__=="__main__"
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">10
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">Defender 误报
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">venv 里的 exe/ffmpeg 被拦，随机 PermissionError
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">自检输出”建议排除项”：E:\nvme、E:\weights、项目 venv、ffmpeg.exe
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">11
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">端口检测无 ss/lsof
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">8501 被占无法判断
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">用 socket().bind(("127.0.0.1",8501)) 探测，或 netstat -ano 解析
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">12
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">TSV 用 Excel 打开乱码
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">用户以为导出坏了
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">写 UTF-8 BOM (\ufeff)，这是 TSV 唯一需要偏离纯 UTF-8 的地方
+
+二十、模型与权重清单
+20.1 必装清单
+<w:tblPr><w:tblStyle w:val="Table"/><w:tblW w:type="pct" w:w="5000"/><w:tblLayout w:type="fixed"/><w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0" w:val="0020"/></w:tblPr><w:tblGrid><w:gridCol w:w="1320"/><w:gridCol w:w="1320"/><w:gridCol w:w="1320"/><w:gridCol w:w="1320"/><w:gridCol w:w="1320"/><w:gridCol w:w="1320"/></w:tblGrid><w:tr><w:trPr><w:tblHeader w:val="on"/></w:trPr><w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">#
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">名称
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">用途
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">体积
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">放哪
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">缺了会怎样
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">1
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">Qwen3-VL-Embedding-2B
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">语义向量：文本/图片/视频帧 → 2048 维
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">~4.3GB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">E:\weights\qwen3-vl-embedding-2b（mklink 映射）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">语义检索全线瘫痪
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">2
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">insightface buffalo_l（5 个 onnx）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">SCRFD 检脸 + ArcFace 512 维 + 关键点对齐
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">~326MB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">E:\weights\insightface\buffalo_l\（mklink 映射）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">人脸管线全部失效，照片墙空白
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">3
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">ffmpeg + ffprobe（静态构建 exe）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">抽帧、读容器时长、探视频属性
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">~100MB
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rStyle w:val="VerbatimChar"/></w:rPr><w:t xml:space="preserve">.\\bin\ffmpeg.exe
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">视频无法索引，只出照片
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">4
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">Qdrant（Docker 镜像）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">向量数据库
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">~25MB（镜像）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">Docker 容器，数据存命名卷
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">向量检索不可用
+<w:tc><w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">5
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t xml:space="preserve">PySceneDetect（pip 安装）
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">镜头切分
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">免权重
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:t xml:space="preserve">pip install
+<w:tcPr/><w:p><w:pPr><w:pStyle w:val="Compact"/></w:pPr><w:r><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr><w:t xml:space="preserve">视频镜头切分不可用
+20.2 不需要装的
+CLIP / open_clip：已被 Qwen3-VL-Embedding 取代，P1 可选对照实验
+flash-attn：Windows 编译困难且非必要，用 SDPA
+Qwen3-VL-Reranker-2B：P1 再定，非 P0 必需
+任何云 API key：全程离线
+20.3 权重路径注意事项
+项目权重目录：${project_root}\weights\
+风险：中文目录名 + 空格 + C 盘桌面（可能被 OneDrive 同步/云占位符化）；建议将权重通过 mklink 映射到 ${project_root}\weights\ 下
+建议方案：用目录联接（junction）建英文短入口（管理员 PowerShell）：
+cmd /c 'mklink /J "${project_root}\weights\qwen" "C:\Users\lixiaolong\Desktop\建设多媒体整理系统\weight\Qwen3-VL-Embedding-2B"'cmd /c 'mklink /J "${project_root}\weights\buffalo_l" "C:\Users\lixiaolong\Desktop\建设多媒体整理系统\weight\buffalo_l"'
+代码只认 ${project_root}\weights\...。
+20.4 Qdrant Docker 部署
+镜像拉取（国内镜像）：
+docker pull docker.m.daocloud.io/qdrant/qdrant:latestdocker tag docker.m.daocloud.io/qdrant/qdrant:latest qdrant/qdrant:latest
+启动命令：
+docker run -d --name qdrant -p 6333:6333 -p 6334:6334 ^  -v qdrant_storage:/qdrant/storage ^  -v qdrant_snapshots:/qdrant/snapshots ^  -e QDRANT__SERVICE__HOST=0.0.0.0 ^  -e QDRANT__TELEMETRY_DISABLED=true ^  --restart unless-stopped ^  qdrant/qdrant
+验证：curl http://127.0.0.1:6333/collections → {"result":{"collections":[]},"status":"ok"}
+
+二十一、环境准备核对单
+在交给 agent 开工前，请确保以下全部打勾：
+[ ] ffmpeg.exe / ffprobe.exe 就位，ffprobe -version 通过[ ] Docker Desktop 运行中，qdrant 容器 up，curl /collections 返回 ok[ ] venv 建好，torch.cuda.is_available()=True[ ] onnxruntime-gpu 已安装，ort.get_available_providers() 包含 CUDAExecutionProvider[ ] buffalo_l 五个 onnx 齐全且体积正常（det_10g>100MB, w600k_r50>100MB）[ ] Qwen 权重 mklink 到 ${project_root}\weights\qwen，safetensors 合计约 4.3GB[ ] 长路径启用（LongPathsEnabled=1）[ ] PYTHONUTF8=1 已设置[ ] TMP/TEMP 指向 ${project_root}\tmp[ ] 四个绝对路径定死：库根(${media_root}) / nvme_root(E:\nvme) / weights(${project_root}\weights) / qdrant(127.0.0.1:6333)[ ] 最小测试集 + 20 条 query 草稿备好
+全部打勾后，即可将本规格文档交付 agent，让它先输出 Milestone 拆分表和风险清单（按第十五章的要求），确认后再动笔写 P0。

@@ -1,0 +1,87 @@
+# =============================================================================
+# 素材整理与检索系统 · Git 忽略规则
+# 原则：源码与文档进仓库，**素材、模型、数据库、中间文件、虚拟环境一律不进**。
+#
+# 实测体积（2026-10-19）：
+#   data/    59.4 GB   ← 库文件 + 中间图（关键帧/缩略图/人脸小图）
+#   weight/   8.3 GB   ← Qwen3-VL 模型 + buffalo_l 人脸模型
+#   .venv/    8.1 GB   ← Python 虚拟环境（可由 requirements.txt 重建）
+#   tmp/      0.95 GB  ← 诊断脚本 + 测试用的库副本
+# 不做下面这些排除，一次 push 会尝试传约 77 GB，必然失败或把仓库拖垮。
+# =============================================================================
+
+# ---------- 虚拟环境 / Python 缓存 ----------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------- 素材与中间产物（体积最大） ----------
+data/
+!data/.gitkeep
+weight/
+models/
+bin/*.exe
+bin/*.dll
+
+# ---------- 数据库（含 WAL/SHM） ----------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+tmp/*.db
+tmp/*.db-wal
+tmp/*.db-shm
+
+# ---------- 日志 ----------
+*.log
+logs/
+
+# ---------- 配置：本机路径不该进仓库 ----------
+# config.yaml 是出厂默认值，保留；下面这个由界面「设置」生成，含本机绝对路径。
+config.local.yaml
+config.local.yaml.tmp
+*.local.yaml
+
+# ---------- 导出与临时文件 ----------
+export/
+*.tmp
+*.bak
+*.orig
+*.rej
+tmp/*.log
+tmp/_*.json
+tmp/_*.txt
+
+# ---------- 测试产物 ----------
+tests/_smoke/
+tests/media_smoke/
+tests/**/__pycache__/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+
+# ---------- 隐私：素材清单、导出结果、截图 ----------
+*.tsv
+*.xlsx
+screenshots/
+
+# ---------- 测试临时目录 ----------
+tmp/tmp*/
+tmp/*.jpg
+tmp/*.png
+
