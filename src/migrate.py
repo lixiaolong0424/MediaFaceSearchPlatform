@@ -268,8 +268,19 @@ def apply(cfg: Config, new_root: str, *, old_root: Optional[str] = None,
     return stats
 
 
-def _purge_rows(cfg: Config, conn, gone: List[Tuple[int, str, str]]) -> int:
-    """物理删除这些文件的 SQLite 行与向量（绝不碰磁盘上的用户文件）。"""
+def _purge_rows(cfg: Config, conn, gone: List[Tuple[int, str, str]],
+                *, batch: int = 500, progress=None) -> int:
+    """物理删除这些文件的 SQLite 行与向量（绝不碰磁盘上的用户文件）。
+
+    两处关键优化（2026-10-23）：
+      1. 向量按**点 ID** 删（人脸=fase_id、画面=(file_id<<20)|shot_ix），
+         比按 file_id 过滤删快一个数量级（过滤删要在 20 多万点上扫 payload）。
+      2. 每批 SQL 放在一个事务里，锁冲突退避重试；
+         重试仍失败就抛异常 —— 绝不"记个 warning 就当删掉了"，
+         否则会静默留下孤儿行（实测出现过一次）。
+    """
+    import time as _t
+
     try:
         from .vector_store import open_store, face_collection, semantic_collection
 
@@ -280,26 +291,76 @@ def _purge_rows(cfg: Config, conn, gone: List[Tuple[int, str, str]]) -> int:
         LOG.warning("Qdrant 不可用，只清 SQLite：%s", exc)
         store = None
         sem = fac = ""
-    n = 0
-    for fid, _path, _kind in gone:
+
+    ids = [int(fid) for fid, _p, _k in gone]
+    done = 0
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i + batch]
+        q = ",".join("?" * len(chunk))
+
+        # 1) 先查点 ID（必须在删 SQL 行之前）
+        face_ids: List[int] = []
+        shot_ids: List[int] = []
+        try:
+            face_ids = [int(r[0]) for r in conn.execute(
+                f"SELECT face_id FROM face_records WHERE file_id IN ({q})", chunk)]
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("取 face_id 跳过：%s", exc)
+        try:
+            shot_ids = [int(fid) << 20 | int(ix) for fid, ix in conn.execute(
+                f"SELECT file_id, shot_ix FROM shots WHERE file_id IN ({q})", chunk)]
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("取 shot_id 跳过：%s", exc)
+
+        # 2) 删向量（点 ID，两个 collection）
         if store is not None:
-            for coll in (sem, fac):
+            if fac and face_ids:
+                store.delete_ids(fac, face_ids)
+            if sem and shot_ids:
+                store.delete_ids(sem, shot_ids)
+
+        # 3) 删 SQLite 行：一个事务 + 锁冲突退避重试
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    store.delete_by_file(coll, fid)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning("删除向量失败 file_id=%s coll=%s：%s", fid, coll, exc)
-        conn.execute("DELETE FROM face_records WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM shots WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM file_encoding WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM stage_status WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM dead_letter WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM path_index WHERE file_id=?", (fid,))
-        conn.execute("DELETE FROM files WHERE file_id=?", (fid,))
-        n += 1
-        if n % 200 == 0:
-            conn.commit()
-    conn.commit()
-    return n
+                    conn.execute(
+                        f"DELETE FROM face_clusters WHERE face_id IN "
+                        f"(SELECT face_id FROM face_records WHERE file_id IN ({q}))",
+                        chunk)
+                except Exception as exc:  # noqa: BLE001 - 表可能不存在
+                    LOG.debug("清理 face_clusters 跳过：%s", exc)
+                for table in ("face_records", "shots", "file_encoding",
+                              "stage_status", "dead_letter", "path_index", "files"):
+                    try:
+                        conn.execute(f"DELETE FROM {table} WHERE file_id IN ({q})", chunk)
+                    except Exception as exc:  # noqa: BLE001 - 表不存在可忽略
+                        if "no such table" not in str(exc).lower():
+                            raise
+                conn.commit()
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                if "locked" in str(exc).lower() and attempt < 3:
+                    _t.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        if last_exc is not None:
+            raise RuntimeError(f"删除第 {i // batch + 1} 批失败：{last_exc}") from last_exc
+
+        done += len(chunk)
+        if progress is not None:
+            try:
+                progress(done, len(ids))
+            except Exception:  # noqa: BLE001
+                pass
+    return done
 
 
 def _write_media_root(cfg: Config, new_root: str) -> None:

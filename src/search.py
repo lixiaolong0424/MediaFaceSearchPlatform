@@ -442,7 +442,7 @@ def semantic_recall(
     raw = store.search_knn(coll, query_vec, k)
     # 只保留 done 的文件（铁律 3）
     done_ids = {int(r["file_id"]) for r in conn.execute(
-        "SELECT file_id FROM files WHERE status='done'")}
+        "SELECT file_id FROM files WHERE status='done' AND visible=1")}
     hits = [h for h in raw if h.file_id in done_ids]
     return hits_to_shot_hits([(h, h.score, 1) for h in hits], badge=BADGE_SEMANTIC)
 
@@ -656,7 +656,7 @@ def _search_by_face_id_impl(
     raw = store.search_knn(coll, vec, int(k or cfg.get("retrieval.k_hard", 200)) + 1)
     raw = [h for h in raw if int(h.payload.get("face_id") or -1) != int(face_id)]
     done_ids = {int(r["file_id"]) for r in conn.execute(
-        "SELECT file_id FROM files WHERE status='done'")}
+        "SELECT file_id FROM files WHERE status='done' AND visible=1")}
     raw = [h for h in raw if h.file_id in done_ids]
     scores = [h.score for h in raw]
     cut = adaptive_cut(scores, k_hard=int(cfg.get("retrieval.k_hard", 200)),

@@ -84,7 +84,10 @@ def page_tasks(cfg: Config) -> None:
     with c1:
         if st.button("清理 30 天前记录"):
             n = T.purge_history(cfg)
-            flash(f"已清理 {n['tasks']} 条任务记录、{n['events']} 条事件", "success")
+            if n.get("error"):
+                flash(n["error"], "warning")
+            else:
+                flash(f"已清理 {n['tasks']} 条任务记录、{n['events']} 条事件", "success")
             st.rerun()
 
 
@@ -142,7 +145,7 @@ def media_roots_panel(cfg: Config, *, reload_cfg=None) -> None:
         rows = []
         for r in roots:
             state = []
-            state.append("启用" if r["enabled"] else "已停用")
+            state.append("启用" if r["enabled"] else "已停用（不显示/不搜索）")
             if not r["exists"]:
                 state.append("⚠️ 路径不存在")
             state.append("已建立索引" if r["files"] else "未扫描")
@@ -175,11 +178,11 @@ def media_roots_panel(cfg: Config, *, reload_cfg=None) -> None:
                 ss["media_remove"] = None
                 st.rerun()
         with c3:
-            label = "停用（暂不扫描）" if cur["enabled"] else "重新启用"
+            label = "停用（不显示·不搜索）" if cur["enabled"] else "重新启用"
             if st.button(label, use_container_width=True):
                 try:
                     MR.set_enabled(cfg, cur["path"], not cur["enabled"])
-                    flash("已更新。停用的文件夹不再扫描，但里面的文件仍可搜索。", "success")
+                    flash("已停用：不再扫描，也不会出现在搜索 / 照片墙 / 人脸分组里；记录与向量都还在，点「重新启用」立刻恢复。" if cur["enabled"] else "已启用：这个文件夹的素材重新参与扫描、搜索与照片墙。", "success")
                 except ValueError as exc:
                     flash(str(exc), "error")
                 if reload_cfg:
@@ -221,12 +224,15 @@ def media_roots_panel(cfg: Config, *, reload_cfg=None) -> None:
     if ss.get("media_remove"):
         rp = ss["media_remove"]
         st.warning(f"要移除的是：`{rp}`")
+        st.markdown("**移除 = 把这个文件夹的记录与向量从数据库里删掉**"
+                    "（磁盘上的图片/视频一个都不会动，随时可以重新扫回来）。\n\n"
+                    "如果只是想暂时「不显示、不搜索」它，请用上方的 **停用**。")
         mode = st.radio(
             "移除后怎么处理这个文件夹里的数据",
-            ["only", "purge"],
+            ["purge", "only"],
             format_func=lambda v: {
-                "only": "只从列表移除 —— 记录、向量、人脸全保留，仍可搜索",
-                "purge": "同时清理数据 —— 删除它的记录与向量（磁盘上的原文件不动）",
+                "purge": "从库中完整删除 —— 记录、向量、人脸一起删（磁盘原文件不动）",
+                "only": "只从列表移除、数据保留 —— 记录还在库里，仍会被搜到（不推荐）",
             }[v], index=0, key="mr_remove_mode")
         ok = st.checkbox("我确认", key="mr_remove_ok")
         c1, c2 = st.columns(2)
@@ -247,6 +253,26 @@ def media_roots_panel(cfg: Config, *, reload_cfg=None) -> None:
 
 
 
+def _performance_values(turbo: bool) -> Dict[str, Any]:
+    """「全速模式」对应的几项配置值（一键应用 / 一键恢复都用它）。"""
+    if turbo:
+        return {
+            "performance.mode": "turbo",
+            "performance.photo_prefetch": 6,
+            "performance.video_workers": 12,
+            "performance.frame_workers": 8,
+            "performance.encode_batch": 32,
+            "performance.encode_group": 12,
+        }
+    return {
+        "performance.mode": "balanced",
+        "performance.photo_prefetch": 0,
+        "performance.video_workers": 0,
+        "performance.encode_batch": 0,
+        "performance.encode_group": 0,
+    }
+
+
 def page_settings(cfg: Config, *, reload_cfg=None) -> None:
     ss = st.session_state
     st.markdown(f"## {U.t('set.title')}")
@@ -255,6 +281,35 @@ def page_settings(cfg: Config, *, reload_cfg=None) -> None:
 
     # ---- 素材文件夹：增 / 删 / 改 / 单独扫描（多目录）----
     media_roots_panel(cfg, reload_cfg=reload_cfg)
+    st.divider()
+
+    # ---- 性能 / 全速模式（方案 B）----
+    st.markdown("### 性能")
+    _turbo_now = str(cfg.get("performance.mode", "balanced")) == "turbo"
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        # key 跟随当前配置状态：配置变了 widget 会重建，
+        # 避免「session 里还记着旧的关，一点应用就把全速撤销」
+        turbo = st.toggle(
+            "全速模式（照片预读 + 视频并发 12 + 编码批 32）",
+            value=_turbo_now,
+            key=f"perf_turbo_{'on' if _turbo_now else 'off'}",
+            help="打开后：照片预读 6 线程、视频并发 12、编码批大小 32。"
+                 "CPU/磁盘/GPU 会更满，界面可能变卡；随时可以关掉。")
+    with c2:
+        if st.button("立即应用", use_container_width=True):
+            try:
+                SS.save(cfg, _performance_values(turbo), who="界面")
+                flash("已切换到「全速模式」" if turbo else "已恢复「均衡模式」", "success")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"应用失败：{exc}", "error")
+            if reload_cfg:
+                reload_cfg()
+            st.rerun()
+    with c3:
+        st.caption(f"当前：照片预读 {int(cfg.get('performance.photo_prefetch', 0) or 0)} 线程 · "
+                   f"视频 {int(cfg.get('performance.video_workers', 0) or 0) or '默认'} 并发 · "
+                   f"编码批 {int(cfg.get('performance.encode_batch', 0) or 0) or '默认'}")
     st.divider()
 
     cur = SS.current(cfg)
@@ -381,10 +436,21 @@ def page_maintain(cfg: Config) -> None:
             confirm = st.checkbox("我确认要物理删除", key="purge_confirm")
             if st.button("🗑 删除记录与向量", type="primary", disabled=not confirm,
                          help="只删库里的记录和向量，磁盘上的文件一个都不动"):
-                res = MG.purge_missing(cfg, picked or None, dry_run=False)
-                flash(f"已清理 {res.get('purged', 0)} 个文件的记录与向量（磁盘文件未动）",
-                      "success")
+                try:
+                    res = MG.purge_missing(cfg, picked or None, dry_run=False)
+                    n = int(res.get("purged") or 0)
+                    left = int(MG.missing_report(cfg, limit=1)["total"] or 0)
+                    if n == 0:
+                        flash("匹配到 0 条可删记录：选中的行可能已被恢复或已清理，"
+                              "请点「重新读取」后再试（这次没有删任何东西）。", "warning")
+                    else:
+                        flash(f"已删除 {n} 条记录及其向量（磁盘文件未动）。"
+                              f"现在还剩 {left} 条缺失记录。", "success")
+                except Exception as exc:  # noqa: BLE001 - 一定要把真实原因告诉用户
+                    flash(f"清理失败：{type(exc).__name__}: {exc}", "error")
                 st.rerun()
+        if st.button("重新读取列表", help="如果列表和实际不一致，点这里重新查一遍"):
+            st.rerun()
         pr = st.session_state.get("purge_report")
         if pr:
             st.info(f"将清理 {pr['would_purge']:,} 个文件的记录与向量。前几条示例：")
@@ -427,17 +493,42 @@ def page_maintain(cfg: Config) -> None:
             "（正脸、侧脸、戴眼镜、遮挡各几张更好）。系统会算出最合适的识别灵敏度。"
             "这些照片只用来算阈值，不会加入素材库。"
         )
-        gold = st.text_input("照片集文件夹", value=str(cfg.get("cluster.gold_root") or ""),
-                             placeholder=r"例如 D:\金标准集")
-        if st.button("保存这个路径"):
+        cur_roots = list(cfg.get("cluster.gold_roots") or [])
+        if not cur_roots and cfg.get("cluster.gold_root"):
+            cur_roots = [str(cfg.get("cluster.gold_root"))]
+        gold_text = st.text_area(
+            "照片集文件夹（一行一个，可加多个）",
+            value="\n".join(str(x) for x in cur_roots), height=110,
+            placeholder="D:\\金标准集\nE:\\另一个来源",
+            help="每个目录里按「人名」建子文件夹；也可以直接把「一个人」的目录加进来"
+                 "（此时用目录名当人名）。同名子文件夹会被合并成同一个人。")
+        col1, col2 = st.columns([1, 1])
+        if col1.button("保存这些路径"):
+            lines = [ln.strip() for ln in gold_text.splitlines() if ln.strip()]
             try:
-                SS.save(cfg, {"cluster.gold_root": gold}, who="界面/维护")
-                flash("已保存。", "success")
+                # 同时写列表与首项：gold_root 供 17_gold.py 的命令行兜底使用
+                SS.save(cfg, {"cluster.gold_roots": lines,
+                              "cluster.gold_root": lines[0] if lines else ""},
+                        who="界面/维护")
+                flash(f"已保存 {len(lines)} 个目录。", "success")
             except Exception as exc:  # noqa: BLE001
                 flash(f"保存失败：{exc}", "error")
             st.rerun()
-        _start_btn(cfg, "gold", "开始标定", disabled_if_empty=not (cfg.get("cluster.gold_root") or gold))
 
+        lines_now = [ln.strip() for ln in gold_text.splitlines() if ln.strip()]
+        if col2.button("开始标定", type="primary",
+                       disabled=active_task(cfg) is not None or not lines_now):
+            try:
+                SS.save(cfg, {"cluster.gold_roots": lines_now,
+                              "cluster.gold_root": lines_now[0]},
+                        who="界面/维护")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"保存失败：{exc}", "error")
+                st.rerun()
+            if start_task(cfg, "gold"):
+                st.rerun()
+        st.caption("标定结果看 data/gold/：result_*.json（PR 曲线数据）、"
+                   "false_positives.csv（被判为同一人的错对）。")
 
 def _start_btn(cfg: Config, kind: str, label: str, *, help_text: Optional[str] = None,
                disabled_if_empty: bool = False, params: Optional[Dict[str, Any]] = None) -> None:
@@ -536,6 +627,31 @@ def _log_panel(cfg: Config) -> None:
 # =========================================================================== #
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _disk_rows(db_path_str: str, root_str: str, logs: str, export: str,
+               nvme_used: int) -> List[Dict[str, Any]]:
+    """磁盘占用表。**中间文件不在这里遍历**：用后台已算好的值。
+
+    2026-10-20 修：原实现对 nvme 目录调 dir_size_bytes（14 万文件、47 秒），
+    每次进「关于」页都要重走一遍 —— 用户感受是「切到这个 tab 卡半分钟」。
+    """
+    from .common import dir_size_bytes
+
+    rows: List[Dict[str, Any]] = []
+    rows.append({"项目": "数据库", "位置": db_path_str,
+                 "大小": human_bytes(Path(db_path_str).stat().st_size)
+                 if Path(db_path_str).exists() else "—"})
+    rows.append({"项目": "中间文件", "位置": root_str,
+                 "大小": human_bytes(nvme_used) if nvme_used else "统计中…"})
+    for label, p in (("导出", export), ("日志", logs)):
+        try:
+            size = human_bytes(dir_size_bytes(Path(p))) if Path(p).exists() else "—"
+        except Exception:  # noqa: BLE001
+            size = "—"
+        rows.append({"项目": label, "位置": p, "大小": size})
+    return rows
+
+
 def page_about(cfg: Config, stats: Dict[str, Any]) -> None:
     st.markdown(f"## {U.t('about.title')}")
     c1, c2, c3, c4 = st.columns(4)
@@ -560,32 +676,29 @@ def page_about(cfg: Config, stats: Dict[str, Any]) -> None:
                  use_container_width=True, hide_index=True)
 
     st.markdown(f"### {U.t('about.disk')}")
-    d = []
-    for label, dotted in (("数据库", "db.path"), ("中间文件", "paths.nvme_root"),
-                          ("导出", "paths.export"), ("日志", "paths.logs")):
-        p = Path(str(cfg.get(dotted)))
-        if p.is_file():
-            d.append({"项目": label, "位置": str(p), "大小": human_bytes(p.stat().st_size)})
-        else:
-            from .common import dir_size_bytes
+    _nv = 0
+    try:
+        import json as _json
 
-            try:
-                size = human_bytes(dir_size_bytes(p)) if p.exists() else "—"
-            except Exception:  # noqa: BLE001
-                size = "—"
-            d.append({"项目": label, "位置": str(p), "大小": size})
-    st.dataframe(pd.DataFrame(d), use_container_width=True, hide_index=True)
+        _raw = T.setting_get(cfg, "nvme_usage")
+        _nv = int((_json.loads(_raw) or {}).get("bytes") or 0) if _raw else 0
+    except Exception:  # noqa: BLE001
+        _nv = 0
+    st.dataframe(pd.DataFrame(_disk_rows(
+        str(cfg.db_path), str(cfg.get("paths.nvme_root")),
+        str(cfg.get("paths.logs")), str(cfg.get("paths.export")), _nv)),
+        use_container_width=True, hide_index=True)
 
     st.markdown(f"### {U.t('about.schema')}")
     st.caption("启动时自动探测（表名/字段名不写死，直接从库里读）。")
     if st.button("重新探测"):
-        st.session_state.pop("_schema_cache", None)
-    schema = st.session_state.get("_schema_cache") or _discover_schema(cfg)
+        _discover_schema.clear()
+    schema = _discover_schema(str(cfg.db_path))
     st.session_state["_schema_cache"] = schema
     if schema.get("error"):
         st.error(schema["error"])
     for t in schema.get("tables", []):
-        with st.expander(f"{t['name']}（{t['rows']:,} 行）"):
+        with st.expander(f"{t['name']}（约 {t['rows']:,} 行）"):
             st.code(", ".join(t["cols"]), language="text")
     st.caption("向量库：")
     for c in schema.get("collections", []):
@@ -630,13 +743,38 @@ def page_groups(cfg: Config) -> None:
     st.markdown("## 自动分组")
     cur = C.current_version(cfg)
     runs = C.version_history(cfg, limit=10)
+
+    # ---- 常驻入口：不管有没有跑过，这里都能发起分组 ----
+    active = active_task(cfg) is not None
+    c0, c1 = st.columns([1, 3])
+    with c0:
+        label = "开始分组" if not cur else "重新分组"
+        if st.button(label, type="primary", use_container_width=True, disabled=active,
+                     help="读取全部人脸向量 → 降维 → 自动分组，产出新版本；"
+                          "旧版本保留、可一键回退"):
+            st.session_state["confirm_cluster"] = True
+    with c1:
+        st.caption("29 万张脸：降维约几十分钟到一两个小时（纯 CPU，可同时浏览其他页面）。"
+                   + ("　⚠️ 有任务正在运行，先等它结束或停止它。" if active else ""))
+
+    if st.session_state.get("confirm_cluster"):
+        st.warning("重新分组会产出新版本并切换过去（旧版本保留、可随时回退）。确定现在开始吗？")
+        cc1, cc2 = st.columns(2)
+        if cc1.button("确定开始分组", type="primary", use_container_width=True):
+            st.session_state["confirm_cluster"] = False
+            if start_task(cfg, "cluster"):
+                flash("分组任务已启动，进度见左侧「当前任务」。", "success")
+                st.rerun()
+        if cc2.button("取消", use_container_width=True):
+            st.session_state["confirm_cluster"] = False
+            st.rerun()
+
     if not cur or not runs:
         st.info(
             "还没有分组结果。\n\n"
-            "点左侧「更多操作 → 自动分组」：系统会把长得像的人脸归到一组，"
-            "之后就能按人浏览。29 万张脸大约要十几分钟（试跑 2 万张约 10 秒）。"
+            "点上面的「开始分组」：系统会把长得像的人脸归到一组，之后就能按人浏览。"
+            "先用 2 万张试跑只要 10 秒，确认参数合适再跑全量。"
         )
-        _start_btn(cfg, "cluster", "开始分组")
         return
 
     info = next((r for r in runs if r["version"] == cur), runs[0])
@@ -696,7 +834,54 @@ def page_groups(cfg: Config) -> None:
                     if tp is not None:
                         st.image(str(tp), width="stretch")
                     st.caption(f"`{int(m['face_id'])}`")
-        st.caption("合并/拆分将在下一步提供（需要先确认这些组对不对）。")
+        # ---- 人工修正（规格 §6.5：聚类一定会错，错得有出口）----
+        st.markdown("#### 修正这一组")
+        col1, col2 = st.columns([3, 1])
+        cur_name = next((g.get("name") for g in groups
+                         if int(g["cluster_id"]) == int(pick)), None)
+        nm = col1.text_input("给这个人起个名字", value=str(cur_name or ""),
+                             placeholder="例如：张三", key="gp_name")
+        if col2.button("保存名字", use_container_width=True):
+            try:
+                C.set_name(cfg, int(pick), nm)
+                flash(f"第 {pick} 组已命名为「{nm}」。", "success")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"命名失败：{exc}", "error")
+            st.rerun()
+
+        col3, col4 = st.columns([3, 1])
+        others = [int(g["cluster_id"]) for g in groups
+                  if int(g["cluster_id"]) != int(pick)]
+        tgt = col3.selectbox("把这一组合并到…", others, key="gp_merge_tgt",
+                             format_func=lambda c: f"第 {c} 组 · "
+                                                   f"{int(next(g['size'] for g in groups if int(g['cluster_id']) == c))} 张")
+        if col4.button("合并过去", use_container_width=True, type="primary"):
+            try:
+                r = C.merge_groups(cfg, int(pick), int(tgt))
+                flash(f"已把 {r['moved']} 张脸并入第 {tgt} 组（可撤销）。", "success")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"合并失败：{exc}", "error")
+            st.rerun()
+
+        picked_faces = st.multiselect(
+            "要拆出去的人脸（选中的会成立一个新组）",
+            [int(m["face_id"]) for m in members], key="gp_split_faces",
+            format_func=lambda f: f"face_id {f}")
+        c5, c6 = st.columns(2)
+        if c5.button("拆分出去", disabled=not picked_faces):
+            try:
+                r = C.split_group(cfg, int(pick), picked_faces)
+                flash(f"已拆出 {r['moved']} 张脸，成立第 {r['new']} 组（可撤销）。", "success")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"拆分失败：{exc}", "error")
+            st.rerun()
+        if c6.button("撤销上一次合并/拆分"):
+            try:
+                r = C.undo_last(cfg)
+                flash(f"已撤销「{r['undone']}」，影响 {r['faces']} 张脸。", "success")
+            except Exception as exc:  # noqa: BLE001
+                flash(f"撤销失败：{exc}", "error")
+            st.rerun()
 
 
 def _group_members(cfg: Config, version: str, cluster_id: int,
@@ -716,7 +901,16 @@ def _group_members(cfg: Config, version: str, cluster_id: int,
     return [dict(r) for r in rows]
 
 
-def _discover_schema(cfg: Config) -> Dict[str, Any]:
+@st.cache_data(ttl=600, show_spinner=False)
+def _discover_schema(db_path: str) -> Dict[str, Any]:
+    """探测 SQLite 表结构与 Qdrant collection 列表（只读）。
+
+    缓存键用 db_path（Config 不可哈希）—— 进函数后用 load_config() 重建一份 cfg，
+    只在缓存未命中时执行一次，代价可忽略。
+    """
+    from .common import load_config
+
+    cfg = load_config()
 
     out: Dict[str, Any] = {"tables": [], "collections": [], "error": None}
     try:
@@ -726,8 +920,10 @@ def _discover_schema(cfg: Config) -> Dict[str, Any]:
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
             for n in names:
+                # COUNT(*) 在 160 万行表上要全表扫；MAX(rowid) 走索引是 O(1)。
+                # 删除过的表会有空洞，所以界面上标「约」。
                 try:
-                    rows = int(c.execute(f"SELECT COUNT(*) FROM [{n}]").fetchone()[0])
+                    rows = int(c.execute(f"SELECT MAX(rowid) FROM [{n}]").fetchone()[0] or 0)
                 except Exception:  # noqa: BLE001
                     rows = 0
                 cols = [r[1] for r in c.execute(f"PRAGMA table_info([{n}])")]
@@ -745,7 +941,7 @@ def _discover_schema(cfg: Config) -> Dict[str, Any]:
                 info = store.collection_info(name)
                 out["collections"].append({
                     "name": name,
-                    "points": int(info.get("points") or 0),
+                    "points": int(info.get("points_count") or info.get("points") or 0),
                     "dim": info.get("dim") or "?",
                 })
             except Exception:  # noqa: BLE001

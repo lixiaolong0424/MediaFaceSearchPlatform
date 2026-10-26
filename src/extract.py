@@ -32,7 +32,7 @@ from PIL import Image
 
 from . import db as D
 from . import tasks as T
-from .common import (
+from .common import (perf_value, 
     Config, find_executable, get_logger, local_now_iso, run_capture,
 )
 from .exif import resolve_capture_time
@@ -202,10 +202,11 @@ class Shot:
 
 
 def ffmpeg_scene_detect(video: Path, cfg: Config, tools: FFmpegTools,
-                        timeout: float = 3600.0) -> Tuple[List[float], str]:
+                        timeout: float = 900.0) -> Tuple[Optional[List[float]], str]:
     """用 ffmpeg 的 scdet 滤镜单遍解码找镜头切点（方案 D）。
 
-    返回 (cuts, method)。cuts 为切换点的秒数，失败返回 ([], reason)。
+    返回 (cuts, method)。**None 表示后端失败**（该换下一个后端），
+    `[]` 表示后端正常工作、但这段视频没有镜头切换（整段算一个镜头）。
 
     原理：
         -vf scdet=threshold=X:sc_pass=1,showinfo
@@ -221,7 +222,7 @@ def ffmpeg_scene_detect(video: Path, cfg: Config, tools: FFmpegTools,
     且软解本就足够快，故不加硬解。
     """
     if not tools.ok or tools.ffmpeg is None:
-        return [], "ffmpeg 不可用"
+        return None, "ffmpeg 不可用"
 
     threshold = float(cfg.get("video.scdet_threshold", 10.0))
     argv = [
@@ -233,10 +234,10 @@ def ffmpeg_scene_detect(video: Path, cfg: Config, tools: FFmpegTools,
     res = run_capture(argv, timeout=timeout)
     err = res.stderr or ""
     if res.timed_out:
-        return [], f"scdet 超时（>{timeout:.0f}s）"
+        return None, f"scdet 超时（>{timeout:.0f}s）"
     if res.returncode != 0 and "pts_time" not in err:
         first = next((l for l in err.splitlines() if l.strip()), "")
-        return [], f"scdet 失败：{first[:160]}"
+        return None, f"scdet 失败：{first[:160]}"
 
     cuts: List[float] = []
     for m in _PTS_RE.finditer(err):
@@ -247,7 +248,7 @@ def ffmpeg_scene_detect(video: Path, cfg: Config, tools: FFmpegTools,
     return cuts, "ffmpeg_scdet"
 
 
-def scenedetect_cuts(video: Path, cfg: Config) -> Tuple[List[float], str]:
+def scenedetect_cuts(video: Path, cfg: Config) -> Tuple[Optional[List[float]], str]:
     """PySceneDetect 回退路径。"""
     threshold = float(cfg.get("video.scene_detect_threshold", 30.0))
     min_len = float(cfg.get("video.min_shot_len_sec", 0.8))
@@ -262,7 +263,7 @@ def scenedetect_cuts(video: Path, cfg: Config) -> Tuple[List[float], str]:
         sm.detect_scenes(v, show_progress=False)
         return [s[0].seconds for s in sm.get_scene_list()], "scenedetect"
     except Exception as exc:  # noqa: BLE001 - 检测失败必须降级而非中断
-        return [], f"PySceneDetect 失败：{exc}"
+        return None, f"PySceneDetect 失败：{exc}"
 
 
 def scene_detect(video: Path, cfg: Config, duration: float,
@@ -280,16 +281,42 @@ def scene_detect(video: Path, cfg: Config, duration: float,
     cuts: List[float] = []
     method = "single"
 
+    # 超长视频：全量 scdet = 整片解码一遍（实测 2 小时片要十几分钟）。
+    # 超过阈值就跳过检测，直接按固定时长切段，把时间花在抽帧上。
+    max_dur = float(cfg.get("video.scdet_max_duration_sec", 1800.0) or 0)
+    if max_dur > 0 and duration > max_dur:
+        chunk = float(cfg.get("video.force_split_sec", 300.0) or 300.0)
+        n = max(1, int(duration // chunk) + 1)
+        step = duration / n
+        cuts = [k * step for k in range(1, n)]
+        LOG.info("视频时长 %.0f 分钟 > 阈值 %.0f 分钟：跳过全量镜头检测，"
+                 "按 %.0f 秒切 %d 段（省一次整片解码）",
+                 duration / 60, max_dur / 60, chunk, n)
+        method = f"fixed_chunk_{int(chunk)}s"
+        shots: List[Shot] = []
+        for k in range(n):
+            st, en = k * step, min(duration, (k + 1) * step)
+            if en - st < min_len:
+                continue
+            shots.append(Shot(len(shots), float(st), float(en)))
+        return (shots or [Shot(0, 0.0, max(duration, min_len))]), method
+
     order = ["ffmpeg", "scenedetect"] if backend != "scenedetect" else ["scenedetect", "ffmpeg"]
     for name in order:
         if name == "ffmpeg":
             got, m = ffmpeg_scene_detect(video, cfg, tools)
         else:
             got, m = scenedetect_cuts(video, cfg)
-        if got:
+        if got is not None:
+            # 成功（哪怕一个切点都没有）。**没有切点 = 整段一个镜头**，
+            # 这是合法结果，绝不能因为空列表就去把整段视频再解码一遍 ——
+            # 那会让"本来就一个镜头"的视频多花一倍时间（实测几分钟）。
             cuts, method = got, m
+            if not got:
+                LOG.info("镜头切分：%s 未检出切换点，按整段单镜头处理（%s）",
+                         name, video.name)
             break
-        LOG.warning("镜头切分后端 %s 未产出切点（%s）：%s", name, m, video.name)
+        LOG.warning("镜头切分后端 %s 失败，换下一个后端（%s）：%s", name, m, video.name)
 
     if not cuts:
         cuts = [0.0]
@@ -462,7 +489,8 @@ def safe_remove(path: Path) -> None:
 
 def compute_workers(cfg: Config) -> int:
     reserve_mb = int(cfg.get("video.per_worker_reserve_mb", 300))
-    cap = int(cfg.get("video.max_worker_cap", 8))
+    # 方案 B2：performance.video_workers 优先于 video.max_worker_cap
+    cap = perf_value(cfg, "video_workers") or int(cfg.get("video.max_worker_cap", 8))
     try:
         import psutil
 
@@ -519,9 +547,87 @@ def _apply_pil_pixel_cap(cfg: Config) -> int:
     return cap
 
 
+class PhotoPrefetcher:
+    """照片字节预读：只并行「读盘」，解码/去重/落库仍在主线程，顺序不变。
+
+    并行整张处理是不行的：去重必须按顺序判定（谁是代表会变），
+    SQLite 也只有一个写连接。但「读盘」没有这两个约束，
+    而机械盘的等待恰好是照片阶段最大的空转（161MB/s、18 张/秒上限）。
+    """
+
+    def __init__(self, paths, threads: int = 4, depth: int = 12) -> None:
+        import queue
+        import threading
+
+        self._q = queue.Queue(maxsize=max(1, depth))
+        self._done = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._items = list(paths)
+        # 共享游标：每个线程取「下一个没读过的」，不能各自从头遍历 ——
+        # 否则 N 个线程会把同一批文件读 N 遍（实测 6 线程时进度几乎停滞）。
+        self._next = 0
+        self._next_lock = threading.Lock()
+        self._workers = []
+        for _ in range(max(1, int(threads))):
+            t = threading.Thread(target=self._run, name="photo-prefetch", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def _claim(self):
+        with self._next_lock:
+            if self._next >= len(self._items):
+                return None
+            item = self._items[self._next]
+            self._next += 1
+            return item
+
+    def _run(self) -> None:
+        while True:
+            if self._stop.is_set():
+                return
+            item = self._claim()
+            if item is None:
+                return
+            fid, path = item
+            try:
+                buf = Path(path).read_bytes()
+            except Exception:  # noqa: BLE001 - 读失败就交给主线程重试
+                buf = None
+            try:
+                self._q.put((fid, buf), timeout=1.0)
+            except Exception:  # noqa: BLE001
+                return
+
+    def take(self, file_id: int, timeout: float = 60.0):
+        import time as _t
+
+        with self._lock:
+            if file_id in self._done:
+                return self._done.pop(file_id)
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            try:
+                fid, buf = self._q.get(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                with self._lock:
+                    if file_id in self._done:
+                        return self._done.pop(file_id)
+                continue
+            if fid == file_id:
+                return buf
+            with self._lock:
+                self._done[fid] = buf
+        return None
+
+    def close(self) -> None:
+        self._stop.set()
+
+
 def process_photo(path: Path, file_id: int, cfg: Config, conn,
                   dedup: Optional[Any] = None,
-                  write_cache: Optional[bool] = None) -> ExtractResult:
+                  write_cache: Optional[bool] = None,
+                  prefetched: Optional[bytes] = None) -> ExtractResult:
     """照片：一趟读盘同时完成 EXIF + （可选）pHash 去重 + NVMe 缓存图。
 
     为什么把 L2a 折进来（2026-10-16 实测的硬件事实）
@@ -549,9 +655,13 @@ def process_photo(path: Path, file_id: int, cfg: Config, conn,
     try:
         from PIL import Image, ImageFile
 
+        import io as _io
+
         ImageFile.LOAD_TRUNCATED_IMAGES = True
         cap = _apply_pil_pixel_cap(cfg)
-        with Image.open(path) as im:
+        # 方案 B1：预读线程已把字节读好，这里直接解码，省掉这次磁盘等待
+        _src = _io.BytesIO(prefetched) if prefetched else path
+        with Image.open(_src) as im:
             w, h = im.size
             if cap and w * h > cap:
                 # 超过我们自己设的上限才算真异常，报错要说清是「我们设的」而不是「坏了」
@@ -715,6 +825,39 @@ def demote_photo(conn, cfg: Config, file_id: int,
         pass
 
 
+def find_video_duplicate(conn, file_id: int, path: Path) -> Optional[int]:
+    """这份视频是否已有「同一个文件」的记录（同 size + 同 mtime + 同文件名）。
+
+    为什么不用时长：files 表里没有 duration 字段（时长只在抽帧时算），
+    而走一遍 ffprobe 又要多一次解码探测。size+mtime+文件名的组合对
+    「拷到另一个文件夹」这种场景已经足够严格 —— 不同视频同时命中三者
+    的概率可以忽略。
+    """
+    try:
+        row = conn.execute(
+            "SELECT size, mtime FROM files WHERE file_id=?", (file_id,)).fetchone()
+        if not row:
+            return None
+        size, mtime = int(row[0] or 0), int(row[1] or 0)
+        name = path.name.lower()
+        cands = conn.execute(
+            "SELECT file_id, path, mtime FROM files "
+            "WHERE size=? AND file_id<>? AND status NOT IN ('skipped_dup','missing') "
+            "ORDER BY file_id LIMIT 20", (size, file_id)).fetchall()
+    except Exception:  # noqa: BLE001 - 去重失败绝不能影响抽帧
+        return None
+    for c in cands:
+        try:
+            if int(c[2] or 0) != mtime:
+                continue
+            if Path(str(c[1])).name.lower() != name:
+                continue
+            return int(c[0])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def process_video(path: Path, file_id: int, cfg: Config, conn, tools: FFmpegTools) -> ExtractResult:
     res = ExtractResult(file_id=file_id, path=str(path), kind=KIND_VIDEO, status="done")
     if not tools.ok:
@@ -729,6 +872,21 @@ def process_video(path: Path, file_id: int, cfg: Config, conn, tools: FFmpegTool
         res.error = f"ffprobe 失败：{probe.error}"
         return res
     res.duration_sec = probe.duration
+
+    # 视频去重（默认开）：照片有 pHash，视频原来**完全没有** — 实测 906 组
+    # 「同 size+mtime+同名 且两条都 done」的重复视频被完整处理了两遍。
+    if bool(cfg.get("dedup.video_enable", True)):
+        dup = find_video_duplicate(conn, file_id, path)
+        if dup is not None:
+            conn.execute(
+                "UPDATE files SET status='skipped_dup', visible=0, "
+                "kind_hint='duplicate', updated_at=? WHERE file_id=?",
+                (local_now_iso(), file_id))
+            set_stage(conn, file_id, STAGE_DEDUP, "done",
+                      error=f"与 #{dup} 同 size+mtime+文件名，判为重复拷贝")
+            res.status = "skipped"
+            res.note = f"duplicate of #{dup}"
+            return res
 
     ct = resolve_capture_time(path, kind="video", priority=cfg.get("exif.priority"),
                               ffprobe_tags=probe.tags)
@@ -746,33 +904,60 @@ def process_video(path: Path, file_id: int, cfg: Config, conn, tools: FFmpegTool
     D.delete_shots(conn, file_id)
     total_frames = 0
     frame_fail = 0
+
+    # ---- 帧抽取并行（B2a）----
+    # 每个 (镜头, 时间点) 的帧互不依赖：都是「seek 到 ts → 解一帧 → 写文件」。
+    # 串行时 CPU 只用一个核、机械盘也常常在等；并行后 4~8 个 ffmpeg 同时跑。
+    # 数据库写入仍在本线程串行，所以写锁语义不变。
+    tasks: List[Tuple[int, float, Path]] = []
     for shot in shots:
-        ts_list = frame_timestamps(shot, cfg, safe_end=safe_end)
-        n_ok = 0
-        for ts in ts_list:
-            out = frame_path(cfg, file_id, shot.shot_ix, ts)
+        for ts in frame_timestamps(shot, cfg, safe_end=safe_end):
+            tasks.append((shot.shot_ix, ts, frame_path(cfg, file_id, shot.shot_ix, ts)))
+
+    n_par = max(1, min(perf_value(cfg, "frame_workers") or
+                       int(cfg.get("video.frame_workers", 4)), 16))
+    LOG.info("抽帧并行度 %d（共 %d 帧，%d 个镜头）", n_par, len(tasks), len(shots))
+
+    def _grab(task: Tuple[int, float, Path]) -> Tuple[int, bool, str]:
+        sid, ts, out = task
+        ok, err = extract_frame(tools.ffmpeg, path, ts, out, short_edge, hwaccel=hwaccel)
+        if ok:
+            good, reason, _w, _h = validate_frame(out, cfg)
+            if not good:
+                ok, err = False, reason
+        for _ in range(max(0, retry)):
+            if ok:
+                break
+            safe_remove(out)
             ok, err = extract_frame(tools.ffmpeg, path, ts, out, short_edge, hwaccel=hwaccel)
             if ok:
                 good, reason, _w, _h = validate_frame(out, cfg)
                 if not good:
                     ok, err = False, reason
-            for _ in range(max(0, retry)):
+        if not ok:
+            safe_remove(out)
+        return sid, ok, err
+
+    ok_per_shot: Dict[int, int] = {}
+    if tasks:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=n_par, thread_name_prefix="grab") as pool:
+            for sid, ok, err in pool.map(_grab, tasks):
                 if ok:
-                    break
-                safe_remove(out)
-                ok, err = extract_frame(tools.ffmpeg, path, ts, out, short_edge, hwaccel=hwaccel)
-                if ok:
-                    good, reason, _w, _h = validate_frame(out, cfg)
-                    if not good:
-                        ok, err = False, reason
-            if ok:
-                n_ok += 1
-            else:
-                frame_fail += 1
-                safe_remove(out)
-                LOG.warning("抽帧失败 file_id=%s shot=%d ts=%.2f：%s", file_id, shot.shot_ix, ts, err)
+                    ok_per_shot[sid] = ok_per_shot.get(sid, 0) + 1
+                else:
+                    frame_fail += 1
+                    LOG.warning("抽帧失败 file_id=%s shot=%s：%s", file_id, sid, err)
+
+    # ---- 落库（串行，写锁窗口 2 秒以内）----
+    last_commit_v = time.monotonic()
+    for _shot_i, shot in enumerate(shots):
+        if _shot_i and (time.monotonic() - last_commit_v) >= 2.0:
+            D.retry_on_lock(conn.commit)
+            last_commit_v = time.monotonic()
+        n_ok = int(ok_per_shot.get(shot.shot_ix, 0))
         if n_ok == 0:
-            # 整个镜头抽帧全失败：仍登记镜头，避免 shots 与 frames 语义错位
             LOG.warning("镜头无可用帧 file_id=%s shot=%d（%.2f~%.2f）", file_id, shot.shot_ix,
                         shot.start, shot.end)
         D.upsert_shot(conn, file_id, shot.shot_ix, shot.start, shot.end, n_frames=n_ok)
@@ -968,8 +1153,29 @@ def run(args, cfg: Config) -> Dict[str, Any]:
     commit_every = max(1, commit_every)
     processed = 0
     last_commit = time.monotonic()   # 写锁窗口的时间上限（见下面的 commit 条件）
+    # ---- 方案 B1：照片预读（只并行读盘；去重顺序、写库顺序都不变）----
+    prefetcher = None
+    _pf_threads = perf_value(cfg, "photo_prefetch")
+    if _pf_threads > 0:
+        try:
+            _items = [(int(r["file_id"]), Path(str(r["path"])))
+                      for r in rows if str(r["kind"]) == KIND_PHOTO]
+            if _items:
+                _depth = int(cfg.get("performance.photo_prefetch_depth", 12) or 12)
+                prefetcher = PhotoPrefetcher(_items, threads=_pf_threads, depth=_depth)
+                LOG.info("照片预读已启用：%d 线程 / 队列 %d 张（待处理照片 %d 张）",
+                         _pf_threads, _depth, len(_items))
+        except Exception as exc:  # noqa: BLE001 - 预读失败退化为串行
+            LOG.warning("照片预读启用失败，退回串行：%s", exc)
+            prefetcher = None
+
     for r in rows:
+        # 每个文件开头响应一次「停止任务」。没有这一行时，
+        # 点停止后本阶段会一直把整批跑完（实测抽帧 1976 个文件 ≈ 几十分钟）。
+        T.cancelled()   # 命中会抛 TaskCancelled，由外层脚本返回退出码 130
         fid, path_s, kind = int(r["file_id"]), str(r["path"]), str(r["kind"])
+        # 进度条上显示「正在处理：完整路径」（只记内存，随 tick 一起写库）
+        T.current(path_s)
         path = Path(path_s)
         if not path.exists():
             conn.execute("UPDATE files SET status='missing', updated_at=? WHERE file_id=?",
@@ -977,8 +1183,9 @@ def run(args, cfg: Config) -> Dict[str, Any]:
             continue
         try:
             if kind == "photo":
+                _buf = prefetcher.take(fid) if prefetcher is not None else None
                 res = process_photo(path, fid, cfg, conn, dedup,
-                                    write_cache=write_cache)
+                                    write_cache=write_cache, prefetched=_buf)
             else:
                 res = process_video(path, fid, cfg, conn, tools)
         except Exception as exc:  # noqa: BLE001 - 单文件失败绝不中断整批
@@ -1049,6 +1256,8 @@ def run(args, cfg: Config) -> Dict[str, Any]:
                      processed, len(rows), stats["done"], stats["skipped"], stats["error"],
                      stats["shots"], stats["frames"], processed / el,
                      (len(rows) - processed) / max(processed / el, 1e-9) / 3600.0, extra)
+    if prefetcher is not None:
+        prefetcher.close()
     conn.commit()
     if dedup is not None:
         # 退出前刷新一次去重计数：进度日志每 batch 条才刷，最后不足一批的会漏报

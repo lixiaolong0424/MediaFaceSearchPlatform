@@ -57,19 +57,38 @@ st.set_page_config(page_title="素材人脸检索系统", page_icon="🔍", layo
 
 
 def open_containing_folder(abs_path: str) -> str:
-    """成功返回 ''，失败返回错误文案。
+    """在资源管理器里定位到这个文件（选中它）。成功返回 ''，失败返回错误文案。
 
-    explorer /select, 逗号后不能有空格；路径含 & , () 时必须整体双引号；
-    整体 shell=True 兼容中文与特殊字符。绝不用 f-string 拼命令行给 shell。
+    2026-10-19 修：原来写的是 `Popen(["explorer", "/select," + path], shell=True)`。
+    shell=True 会让 Python 把列表拼成一条命令行，路径里的空格/中文/&() 一旦
+    破坏解析，explorer 收不到有效路径就**退回默认目录（文档）** ——
+    用户看到的现象就是「打开到了文档文件夹」。
+
+    现在：
+      * 不用 shell，整条命令行自己拼好，路径整体用双引号包住；
+      * 逗号后不留空格（否则 explorer 会把空格也算进文件名）；
+      * 失败时退回「打开父目录」，至少让用户看到文件在哪。
     """
     p = Path(abs_path)
     if not p.exists():
         return f"文件不存在：{abs_path}"
+    if os.name != "nt":
+        try:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open",
+                              str(p.parent)])
+            return ""
+        except Exception as e:  # noqa: BLE001
+            return f"打开文件夹失败：{e}"
     try:
-        subprocess.Popen(["explorer", "/select," + str(p)], shell=True)
+        # shell=False + 整串：CreateProcess 直接拿到命令行，引号由 explorer 解析
+        subprocess.Popen(f'explorer /select,"{p}"', shell=False)
         return ""
     except Exception as e:  # noqa: BLE001
-        return f"打开文件夹失败：{e}"
+        try:
+            os.startfile(str(p.parent))  # type: ignore[attr-defined]
+            return ""
+        except Exception as e2:  # noqa: BLE001
+            return f"打开文件夹失败：{e} / {e2}"
 
 
 def open_with_player(abs_path: str) -> str:
@@ -247,7 +266,7 @@ def _check_config_fresh(cfg: Config) -> None:
 def _ensure_state(cfg: Config) -> None:
     ss = st.session_state
     ss.setdefault("session_id", new_session_id())
-    ss.setdefault("page", "wall")           # v5.3：六页路由，一次只渲染一页
+    ss.setdefault("page", str(cfg.get("ui.start_page", "search") or "search"))   # v5.3 六页路由；默认页可在「设置」里选（默认 search）
     ss.setdefault("media_root", str(cfg.media_root))
     ss.setdefault("wall_mode", "overview")
     # 默认质量下限取 config（faces.quality_min_show）。
@@ -525,10 +544,9 @@ def _render_face_card(cfg: Config, srv, item: Dict[str, Any], *, idx: int,
             if st.button("▶ 预览", key=f"{key}_pv", use_container_width=True):
                 st.session_state[f"preview_{key}"] = not st.session_state.get(f"preview_{key}", False)
         with c2:
-            if st.button("找同款", key=f"{key}_sim", use_container_width=True):
-                st.query_params["face_id"] = str(face_id)
-                st.session_state["tab"] = "ask"
-                st.session_state["pending_face_id"] = face_id
+            if st.button("找同款", key=f"{key}_sim", use_container_width=True,
+                     help="打开这张脸所属的分组（按人浏览）；未分组会提示"):
+                _open_group_of_face(cfg, int(face_id))
                 st.rerun()
         with c3:
             if st.button("📂", key=f"{key}_of", use_container_width=True, help="打开所在文件夹"):
@@ -624,9 +642,7 @@ def _render_hit_card(cfg: Config, srv, fh: Dict[str, Any], *, idx: int) -> None:
             if st.button("找同款", key=f"h{idx}_sim", use_container_width=True,
                          disabled=fid is None):
                 if fid is not None:
-                    st.query_params["face_id"] = str(int(fid))
-                    st.session_state["tab"] = "ask"
-                    st.session_state["pending_face_id"] = int(fid)
+                    _open_group_of_face(cfg, int(fid))
                     st.rerun()
         with act[2]:
             if st.button("📂", key=f"h{idx}_of", use_container_width=True, help="打开所在文件夹"):
@@ -657,6 +673,23 @@ def _tc(sec: Optional[float]) -> str:
 def tab_wall(cfg: Config, srv, stats: Dict[str, Any]) -> None:
     ss = st.session_state
     st.markdown(f"## {U.t('wall.title')}")
+    # ---- 视图开关：按人浏览（分组） / 全部人脸 ----
+    # 「找同款」等操作只能写标志，这里在控件创建之前把它应用掉
+    _forced = ss.pop("_force_wall_view", None)
+    if _forced in ("people", "faces"):
+        ss["wall_view_radio"] = _forced
+        ss["wall_view"] = _forced
+    view = st.radio("视图", ["people", "faces"], horizontal=True,
+                    format_func=lambda v: "按人浏览（分组）" if v == "people"
+                    else "全部人脸（平铺）",
+                    index=0 if ss.get("wall_view", "people") == "people" else 1,
+                    key="wall_view_radio")
+    ss["wall_view"] = view
+    if view == "people":
+        from src.ui_groups import groups_view
+
+        groups_view(cfg, srv)
+        return
     if stats["faces"] == 0:
         _pending = int(stats.get("faces_pending_vector") or 0)
         busy = active_task(cfg) is not None
@@ -931,8 +964,22 @@ def tab_ask(cfg: Config, srv, stats: Dict[str, Any]) -> None:
                                 "这套模型的相似度整体挤在 0.31~0.50，填 0.55 会把结果全砍空。")
         ss["thresh"] = thresh
     with c2:
-        topk = st.number_input("最多返回几条", 10, 2000, int(ss["topk"]), 10, key="k_num")
+        topk = st.number_input("最多返回几条（上限 400000，即整库）", 10, 400000,
+                           int(ss["topk"]), 10, key="k_num")
         ss["topk"] = int(topk)
+        _kh = int(cfg.get("retrieval.k_hard", 2000))
+        _rt = int(cfg.get("retrieval.rerank_topk", 50))
+        _rr_on = int(ss.get("rerank_input_k", 0)) > 0
+        _eff = min(int(topk), _kh, _rt) if _rr_on else min(int(topk), _kh)
+        if int(topk) > _eff:
+            parts = [f"「初筛候选上限」= {_kh}"]
+            if _rr_on:
+                parts.append(f"重排后「最多返回结果数」= {_rt}")
+            st.warning(
+                f"当前实际最多返回 **{_eff}** 条，因为你填的 {int(topk)} 被 "
+                + "、".join(parts)
+                + " 限制住了。想返回更多：设置 → 高级里把这两项一起调大"
+                  "（重排后的上限也要抬），或者把「重排序候选数」选 0 关掉重排。")
     with c3:
         st.write("")
         run = st.button("🔍 开始检索", type="primary", use_container_width=True)
@@ -968,6 +1015,15 @@ def tab_ask(cfg: Config, srv, stats: Dict[str, Any]) -> None:
 
     if not run:
         _render_last_outcome(cfg, srv)
+        return
+
+    # 空输入直接提示，不要白跑一次检索（要加载模型、要十几秒，最后还显示「未命中」）
+    if mode == "text" and not str(text_val or "").strip():
+        st.warning("先在输入框里写一句要找的画面（例如「健身房里深蹲的人」），"
+                   "或者把上面的输入类型切到「图片 / 视频」。")
+        return
+    if mode in ("image", "video") and uploaded is None and pending is None:
+        st.warning("先上传一个文件，或者把输入类型切回「文字描述」。")
         return
 
     if not face_ready and (ss.get("exact_person") or pending is not None):
@@ -1020,11 +1076,131 @@ def tab_ask(cfg: Config, srv, stats: Dict[str, Any]) -> None:
 
     d = outcome.as_dict()
     d["elapsed_sec"] = round(elapsed, 2)
+    # 记住用户实际输入：渲染时要拿它去匹配「分组里的人名」
+    d["query_text"] = str(text_val or "").strip()
     ss["outcome"] = d
     if "face_id" in st.query_params:
         del st.query_params["face_id"]
     _render_last_outcome(cfg, srv)
 
+
+def _filter_outcome_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """在结果集上做筛选：路径关键字 / 拍摄日期区间 / 图片还是视频。
+
+    只在已命中的结果里过滤，不触发重新检索（毫秒级）。
+    筛选条件留在 session_state，翻页/看详情不会丢。
+    """
+    if not files:
+        return files
+    ss = st.session_state
+    with st.expander("筛选结果（路径 / 拍摄日期 / 类型）", expanded=False):
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            kw = st.text_input("路径包含", value=ss.get("rf_path", ""),
+                               placeholder="例如 迅雷云盘 或 2024",
+                               key="rf_path_input").strip()
+            ss["rf_path"] = kw
+        with c2:
+            d1 = st.text_input("拍摄日期 起", value=ss.get("rf_d1", ""),
+                               placeholder="2024-01-01", key="rf_d1_input").strip()
+            d2 = st.text_input("拍摄日期 止", value=ss.get("rf_d2", ""),
+                               placeholder="2024-12-31", key="rf_d2_input").strip()
+            ss["rf_d1"], ss["rf_d2"] = d1, d2
+        with c3:
+            kind = st.radio("类型", ["全部", "图片", "视频"],
+                            index={"全部": 0, "图片": 1, "视频": 2}.get(
+                                ss.get("rf_kind", "全部"), 0),
+                            key="rf_kind_radio")
+            ss["rf_kind"] = kind
+
+    def _keep(fh: Dict[str, Any]) -> bool:
+        path = str(fh.get("path") or "")
+        if kw and kw.lower() not in path.lower():
+            return False
+        if kind != "全部":
+            want = "photo" if kind == "图片" else "video"
+            if str(fh.get("kind") or "") != want:
+                return False
+        cap = str(fh.get("captured_at") or "")
+        # 没有拍摄时间的，只在用户没设日期时保留（否则无从判断，宁可藏起来也别误导）
+        if (d1 or d2) and not cap:
+            return False
+        day = cap[:10]
+        if d1 and day and day < d1:
+            return False
+        if d2 and day and day > d2:
+            return False
+        return True
+
+    kept = [f for f in files if _keep(f)]
+    hidden = len(files) - len(kept)
+    if kw or kind != "全部" or d1 or d2:
+        st.caption(f"筛选后 **{len(kept)}** 个文件（已隐藏 {hidden} 个）"
+                   + ("　· 点「筛选结果」可清空条件" if hidden else ""))
+        if not kept:
+            st.warning("当前筛选条件下没有结果。把条件放宽试试。")
+    return kept
+
+
+def _render_name_hits(cfg: Config, srv, outcome: Dict[str, Any]) -> None:
+    """如果检索词命中了某个分组的人名，把这些组的代表图放在结果最前面。
+
+    为什么需要：用户给组起过名字之后，最自然的检索方式就是直接打名字。
+    但「名字」不在画面里，纯向量检索永远搜不到 —— 只能查 cluster_meta.name。
+    """
+    q = str(outcome.get("query_text") or "").strip()
+    if len(q) < 2:
+        return
+    from src import cluster as C
+
+    try:
+        hits = C.match_names(cfg, q)
+    except Exception:  # noqa: BLE001 - 匹配失败不该影响正常检索结果
+        return
+    if not hits:
+        return
+    st.success(f"「{q}」匹配到 {len(hits)} 个已命名的人 —— 代表图如下（优先展示）")
+    ncols = min(6, len(hits))
+    cols = st.columns(ncols)
+    for j, h in enumerate(hits[:ncols]):
+        with cols[j]:
+            thumb = None
+            tp = str(h.get("thumb_path") or "")
+            if tp:
+                from pathlib import Path as _P
+
+                cand = _P(tp)
+                if not cand.is_absolute():
+                    cand = _P(str(cfg.get("paths.nvme_root"))) / tp
+                if cand.exists():
+                    thumb = cand
+            if thumb is not None:
+                st.image(str(thumb), width="stretch")
+            st.markdown(f"**{h.get('name')}**")
+            st.caption(f"{int(h.get('size') or 0)} 张 · 相似度 "
+                       f"{float(h.get('confidence') or 0):.2f}")
+
+
+
+def _open_group_of_face(cfg: Config, face_id: int) -> None:
+    """找同款 = 打开这张脸所在的分组；没有分组就明确提示。"""
+    from src import cluster as C
+
+    try:
+        g = C.group_of_face(cfg, int(face_id))
+    except Exception as exc:  # noqa: BLE001
+        _flash(f"查分组失败：{exc}", "error")
+        return
+    if not g:
+        _flash("当前照片未列入分组（它是「未分组」的脸，或还没跑自动分组）。", "warning")
+        return
+    # 注意：nav_seg / wall_view_radio 都是控件 key，此刻已经实例化，不能直接改。
+    # 只能写「待处理标志」，由下一轮在创建控件之前应用。
+    st.session_state["open_group"] = int(g["cluster_id"])
+    st.session_state["_force_wall_view"] = "people"
+    st.session_state["_goto_target"] = "wall"
+    _flash(f"已打开第 {g['cluster_id']} 组"
+          + (f"「{g['name']}」" if g.get("name") else ""), "success")
 
 def _render_last_outcome(cfg: Config, srv) -> None:
     outcome = st.session_state.get("outcome")
@@ -1045,6 +1221,8 @@ def _render_last_outcome(cfg: Config, srv) -> None:
     if outcome.get("effective_query"):
         st.caption(f"实际发出的 query：`{outcome['effective_query']}`")
 
+    _render_name_hits(cfg, srv, outcome)
+
     st.markdown(f"### 命中 {outcome.get('total_shots', 0)} 个镜头 / "
                 f"{outcome.get('total_files', 0)} 个文件")
 
@@ -1058,8 +1236,21 @@ def _render_last_outcome(cfg: Config, srv) -> None:
         )
         return
 
-    for i, fh in enumerate(files[:50]):
+    files = _filter_outcome_files(files)
+
+    # 分批渲染：一次画 60 个，其余点按钮继续。
+    # 原来写死 files[:50]，所以即便检索出上千条，界面上也只有 50 个。
+    show = int(st.session_state.get("res_show", 60))
+    batch = 60
+    for i, fh in enumerate(files[:show]):
         _render_hit_card(cfg, srv, fh, idx=i)
+    if len(files) > show:
+        st.caption(f"已显示 {show} / {len(files)} 个")
+        if st.button(f"再显示 {batch} 个", key="res_more"):
+            st.session_state["res_show"] = show + batch
+            st.rerun()
+    else:
+        st.session_state["res_show"] = min(show, max(60, len(files)))
 
     _export_bar(cfg, scope="search_hits", outcome=outcome)
 
@@ -1100,7 +1291,6 @@ def _judge(cfg: Config, qid: str, fh: Dict[str, Any], label: int) -> None:
 
 NAV_PAGES = [
     ("wall", "🖼 ", "nav.wall"),
-    ("groups", "👥 ", "nav.groups"),
     ("search", "🔎 ", "nav.search"),
     ("tasks", "📋 ", "nav.tasks"),
     ("settings", "⚙️ ", "nav.settings"),
@@ -1137,7 +1327,7 @@ def _goto(page: str) -> None:
     st.rerun()
 
 
-def nav_bar() -> str:
+def nav_bar(cfg: Config) -> str:
     """顶部页面导航。做成横排分段控件，是为了让「搜索」这类入口一眼能看见。
 
     为什么不用 st.tabs：Streamlit 的 tabs 会把**所有**页面的内容都执行一遍
@@ -1148,7 +1338,11 @@ def nav_bar() -> str:
     keys = [k for k, _, _ in NAV_PAGES]
     labels = {k: icon + U.t(key) for k, icon, key in NAV_PAGES}
     if ss.get("nav_seg") not in keys:
-        ss["nav_seg"] = ss.get("page") if ss.get("page") in keys else "wall"
+        # 默认落到「设置 → 打开软件时默认显示」选的那一页（默认 search）
+        start = str(cfg.get("ui.start_page", "search") or "search")
+        if start not in keys:
+            start = "search"
+        ss["nav_seg"] = start
     pick = st.segmented_control(
         "页面", keys, format_func=lambda k: labels[k], key="nav_seg",
         label_visibility="collapsed", width="stretch",
@@ -1186,8 +1380,10 @@ def sidebar(cfg: Config, stats: Dict[str, Any], nvme: Dict[str, Any]) -> None:
 
     with st.sidebar:
         # ---- 现在的库 ----
+        # 注意：这里**不显示**「素材文件夹 X」那一行 —— 它取的是 config 里的
+        # media_root，而真正被索引的是下面「根 …」列出的目录，两者可能不一致，
+        # 放一起会让人误以为索引的就是那一条。素材目录在「设置」页管理。
         st.markdown("### 现在的库")
-        st.caption(f"素材文件夹 `{stats['root']}`")
         c1, c2 = st.columns(2)
         c1.metric("素材", f"{int(stats.get('files_total') or 0):,}")
         c2.metric("人脸", f"{int(stats.get('faces') or 0):,}")
@@ -1274,6 +1470,15 @@ def sidebar(cfg: Config, stats: Dict[str, Any], nvme: Dict[str, Any]) -> None:
 
         # ---- 空间 ----
         st.divider()
+        st.markdown("### 性能")
+        _mode = str(cfg.get("performance.mode", "balanced"))
+        _pf = __import__("src.common", fromlist=["perf_value"]).perf_value(cfg, "photo_prefetch")
+        _vw = __import__("src.common", fromlist=["perf_value"]).perf_value(cfg, "video_workers")
+        if _mode == "turbo":
+            st.caption(f"**全速** · 照片预读 {_pf} 线程 · 视频并发 {_vw or '默认'}")
+        else:
+            st.caption("**均衡**（想更快：设置 → 性能 → 全速模式）")
+
         st.markdown("### 空间")
         if nvme.get("pending") or not nvme["known"]:
             # 正在算：挂一个 4 秒自刷新的片段，算完自动显示新数字，
@@ -1364,7 +1569,7 @@ def main() -> None:
                  "videos_error": 0, "faces_pending_vector": 0, "by_status": {}}
 
     nvme = _nvme_usage(cfg)
-    page = nav_bar()                 # 顶部横排导航（照片墙 / 自动分组 / 搜索 / 任务 / 设置 / 维护 / 关于）
+    page = nav_bar(cfg)              # 顶部横排导航（照片墙 / 自动分组 / 搜索 / 任务 / 设置 / 维护 / 关于）
     sidebar(cfg, stats, nvme)
     _show_toast()
     reason = st.session_state.pop("_reload_reason", None)
@@ -1377,8 +1582,6 @@ def main() -> None:
     try:
         if page == "wall":
             tab_wall(cfg, srv, stats)
-        elif page == "groups":
-            _pages.page_groups(cfg)
         elif page == "search":
             tab_ask(cfg, srv, stats)
         elif page == "tasks":

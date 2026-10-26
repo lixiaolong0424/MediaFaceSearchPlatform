@@ -92,6 +92,57 @@ def relax_pil_pixel_limit(limit: int = PIL_MAX_IMAGE_PIXELS) -> int:
 
 relax_pil_pixel_limit()
 
+
+def register_heif_opener() -> bool:
+    """让 PIL 能打开 HEIC/HEIF（iPhone 原片）。
+
+    为什么放在 common.py：所有阶段模块都会 import 它，一处注册全局生效，
+    避免在 extract / dedup / face / encode 各写一遍还漏掉。
+    没装 pillow-heif 时静默跳过 —— 其他格式不受影响。
+    """
+    try:
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+        return True
+    except Exception:  # noqa: BLE001 - 没装就别崩，HEIC 只是不可用
+        return False
+
+
+HEIF_READY = register_heif_opener()
+
+# --------------------------------------------------------------------------- #
+# 性能档位（方案 B）
+# --------------------------------------------------------------------------- #
+TURBO_DEFAULTS: Dict[str, Any] = {
+    "photo_prefetch": 6,
+    "video_workers": 12,
+    "frame_workers": 8,
+    "encode_batch": 32,
+    "encode_group": 12,
+}
+
+
+def perf_value(cfg: Any, key: str) -> int:
+    """读性能参数：**具体值优先，其次按 mode 给默认值**。
+
+    为什么需要它：`performance.mode` 原本只是个标签，代码从不读它 ——
+    把 mode 设成 turbo 而那几个数字仍是 0 时，行为完全不变
+    （用户反馈"切了全速没感觉"的直接原因之一）。
+    """
+    try:
+        explicit = int(cfg.get(f"performance.{key}", 0) or 0)
+    except Exception:  # noqa: BLE001
+        explicit = 0
+    if explicit:
+        return explicit
+    try:
+        turbo = str(cfg.get("performance.mode", "balanced") or "balanced") == "turbo"
+    except Exception:  # noqa: BLE001
+        turbo = False
+    return int(TURBO_DEFAULTS.get(key, 0)) if turbo else 0
+
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "project_root": str(Path(__file__).resolve().parent.parent),
     "media_root": "E:/",

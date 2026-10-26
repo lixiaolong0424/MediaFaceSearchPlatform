@@ -1,5 +1,22 @@
 # 素材人脸检索系统 · 实施说明与验收手册
 
+## 🤖 AI Agent 先读这里
+
+| 想知道什么 | 看哪个文件 |
+|---|---|
+| **怎么安全地改这个项目**（铁律 / 不变量 / 已知陷阱 / 测试地图） | `AGENTS.md` |
+| 系统搭起来的形状（阶段 / 表 / 向量 id / 并发模型） | `docs/ARCHITECTURE.md` |
+| 出问题了怎么查（症状 → 排查 → 处置） | `docs/RUNBOOK.md` |
+| 改了什么、为什么改 | `docs/CHANGELOG.md` |
+| 我要敲什么命令 | `script.md` |
+| 诊断/基准脚本 | `tools/README.md` |
+
+```powershell
+$env:PYTHONUTF8='1'
+.venv\Scripts\python.exe tests\test_v53.py      # 核心回归，应 PASS=75 FAIL=0
+.venv\Scripts\python.exe tools\status.py        # 当前任务/进度
+```
+
 > **交付物**：可安装、可扫描、可检索、可导出、可验收的本地工具（P0 阶段）
 > **规格原文**：`素材人脸检索系统_完整实施规格v3_Windows版.docx`
 > **需求讨论全文**：`多媒体数据查找方案-20261015085922 (2).txt`

@@ -96,6 +96,33 @@ def _indexed_media_files(cfg: Config) -> set[str]:
     return out
 
 
+def _indexed_now(cfg: Config, abs_path: str) -> bool:
+    """实时查一次：这个绝对路径现在是否在库里且未标 missing。
+
+    为什么需要：`self.indexed` 是**服务启动时的快照**。用户移动/改名文件后，
+    新路径不在快照里 → /media 返回 404，表现为「缩略图/预览打不开」，
+    看起来就像地址没更新。这里对未命中的路径做一次**按 path 唯一索引的
+    点查**（O(1)），命中就放行，所以移动后的新路径立刻可用。
+
+    查不到就返回 False（保持「只暴露已索引文件」的安全语义）。
+    """
+    import sqlite3
+
+    from . import db as D
+
+    try:
+        conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE path=? AND status != 'missing' LIMIT 1",
+                (abs_path,)).fetchone()
+        finally:
+            conn.close()
+        return row is not None
+    except (sqlite3.Error, OSError):
+        return False
+
+
 class _Handler(SimpleHTTPRequestHandler):
     """Windows 友好 + 中文路径友好 + 白名单校验。"""
 
@@ -145,9 +172,10 @@ class _Handler(SimpleHTTPRequestHandler):
                 # 文件级白名单：/media 下只允许库中已索引且未标 missing 的文件
                 if self.restrict and mount == MOUNT_MEDIA and target != root:
                     key = str(target).replace("\\", "/").lower()
-                    if key not in self.indexed:
-                        LOG.warning("静态服务拒绝未索引的素材文件：%s", rel)
-                        return str(root / "__not_indexed__")
+                    if key in self.indexed or _indexed_now(self.cfg, str(target)):
+                        return str(target)
+                    LOG.warning("静态服务拒绝未索引的素材文件：%s", rel)
+                    return str(root / "__not_indexed__")
                 return str(target)
         LOG.warning("静态服务拒绝白名单外的路径：%s", rel)
         return str(self._hidden_root() / "__outside_whitelist__")

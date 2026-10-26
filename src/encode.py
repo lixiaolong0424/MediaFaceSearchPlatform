@@ -21,7 +21,7 @@ import numpy as np
 
 from . import db as D
 from . import tasks as T
-from .common import Config, get_logger, human_bytes, local_now_iso, make_point_id
+from .common import perf_value, Config, get_logger, human_bytes, local_now_iso, make_point_id
 from .encode_model import SemanticEncoder, get_encoder
 from .extract import STAGE_EXTRACT, ensure_stage_table, set_stage
 from .vector_store import VectorStore, open_store, semantic_collection
@@ -89,6 +89,9 @@ def collect_shot_frames(conn, cfg: Config, file_id: int,
         return [ShotFrames(shot_ix, shot_start, shot_end, frames)]
 
     for r in rows:
+        # 每个文件开头响应一次「停止任务」。没有这一行时，
+        # 点停止后本阶段会一直把整批跑完（实测抽帧 1976 个文件 ≈ 几十分钟）。
+        T.cancelled()   # 命中会抛 TaskCancelled，由外层脚本返回退出码 130
         sf = ShotFrames(int(r["shot_ix"]), float(r["shot_start"] or 0.0), float(r["shot_end"] or 0.0))
         if base.exists():
             sf.frames = sorted(base.glob(f"{sf.shot_ix:04d}_*.jpg"))
@@ -451,7 +454,9 @@ def run(args, cfg: Config) -> Dict[str, Any]:
     # 成组大小：把整个组的所有帧合成一次 encode_images，照片才不会退化成 batch=1。
     # 8 个文件 × 平均 1.2 帧 ≈ 10 帧；视频文件帧多，成组后由 encode_images 内部
     # 按 semantic.batch_size 再切（并有 OOM 自动折半），不会撑爆显存。
-    group_size = max(1, int(cfg.get("semantic.group_size", 8)))
+    # 方案 B3：分组大小可被 performance.encode_group 覆盖（0=用 semantic.group_size）
+    _pg = perf_value(cfg, "encode_group")
+    group_size = max(1, int(_pg or cfg.get("semantic.group_size", 8)))
     last_commit = time.monotonic()
     for i in range(0, len(rows), group_size):
         group = rows[i:i + group_size]
@@ -460,6 +465,7 @@ def run(args, cfg: Config) -> Dict[str, Any]:
         for r in group:
             if Path(str(r["path"])).exists():
                 alive.append(r)
+                T.current(str(r["path"]))
             else:
                 conn.execute(
                     "UPDATE files SET status='missing', updated_at=? WHERE file_id=?",

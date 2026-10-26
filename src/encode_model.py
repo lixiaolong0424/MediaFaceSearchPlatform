@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .common import Config, get_logger
+from .common import perf_value, Config, get_logger
 
 LOG = get_logger("encode")
 
@@ -61,7 +61,7 @@ class SemanticEncoder:
         self.dimension = int(cfg.get("semantic.dimension", 2048))
         self.mrl_dim = cfg.get("semantic.mrl_dim")
         self.dtype_name = str(cfg.get("semantic.dtype", "bfloat16"))
-        self.batch_size = int(cfg.get("semantic.batch_size", 16))
+        self.batch_size = perf_value(cfg, "encode_batch") or int(cfg.get("semantic.batch_size", 16))
         self.device = device
         self.backend = backend or "auto"
 

@@ -46,7 +46,7 @@ def active_task(cfg: Config) -> Optional[Dict[str, Any]]:
     """
     T.init(cfg)
     try:
-        T.reap_stale(cfg, minutes=2)
+        T.reap_stale(cfg)   # 阈值由 task.stale_minutes 与视频超时自动决定（默认 15 分钟）
     except Exception:  # noqa: BLE001 - 回收失败不该让页面打不开
         pass
     return T.running(cfg)
@@ -57,6 +57,19 @@ def start_task(cfg: Config, kind: str, *, params: Optional[Dict[str, Any]] = Non
     """建任务 + 拉起执行器。返回 task_id；被占用时返回 None。"""
     T.init(cfg)
     T.reap_stale(cfg)
+    # 上一轮被判「心跳超时」但进程其实还活着 —— 绝不能再起第二份脚本，
+    # 否则两份流水线同时写库，会互相拖死（2026-10-20 就这样滚出了 3 份并发）。
+    # 先清掉「pid 已被别的进程占用」的历史记录（PID 复用会让守卫永远命中）
+    try:
+        T.clear_reused_pids(cfg)
+    except Exception:  # noqa: BLE001
+        pass
+    zombies = [z for z in T.live_terminal_tasks(cfg) if z["state"] == "failed"]
+    if zombies:
+        z = zombies[0]
+        flash(f"上一次任务（{z['title']}）的进程其实还在跑（pid {z['pid']}），"
+              f"先等它结束；确实要重来请先去「任务」页把它停掉。", "warning")
+        return None
     busy = active_task(cfg)
     if busy is not None:
         flash(f"{U.t('task.busy')}（{busy['title']}）", "warning")
@@ -86,33 +99,59 @@ def start_task(cfg: Config, kind: str, *, params: Optional[Dict[str, Any]] = Non
 
 
 def stop_task(cfg: Config, task_id: str) -> None:
-    """停止任务，并且**确认它真的停了**。
+    """发出停止请求。**不阻塞界面**。
 
-    只写一个取消标志是不够的：
-      * 子进程在处理一个 30 秒的视频时，要等它做完才看得到标志；
-      * 如果进程早就死了（被强杀 / 重启界面），标志永远没人读，
-        任务就永远挂在 running，界面上的进度条也跟着永远不动。
-    所以这里等 3 秒看心跳有没有动，没动就直接判它已停止。
+    三个阶段脚本现在每个文件都会查一次 cancel 标志
+    （extract / encode / face_pipeline），所以通常 1~5 秒内就能停下来；
+    如果进程已经不在，直接收尾为 cancelled；否则等它自己退出，
+    由 reap_stale 的「cancel=1 + 进程已死」规则兜底收尾。
     """
-    import time as _t
-
-    from datetime import datetime
-
     T.init(cfg)
-    before = (T.get(cfg, task_id) or {}).get("updated_at")
     T.request_cancel(cfg, task_id)
-    _t.sleep(3.0)
     task = T.get(cfg, task_id) or {}
     if task.get("state") not in ("queued", "running"):
         flash("任务已停止。", "success")
         return
-    if task.get("updated_at") != before:
-        flash("已发出停止请求，正在等当前文件处理完（最长约 30 秒）…", "warning")
+    if not T._pid_alive(task.get("pid")):
+        T.finish(cfg, task_id, "cancelled",
+                 message="已停止（进程已不在；下次点开始会从断点继续）")
+        flash("任务进程已经不在，已直接标记为停止。", "success")
         return
-    # 心跳 3 秒没动 = 没有进程在写它 → 直接收尾，别让用户对着僵尸任务干等
-    T.finish(cfg, task_id, "cancelled",
-             message="已停止（进程已不在，直接收尾；下次点开始会从断点继续）")
-    flash("任务进程已经不在，已直接标记为停止。", "success")
+    # 后台看门狗：12 秒后还没退出就强制结束（阶段脚本不一定理会 cancel 标志）
+    _start_stop_watchdog(cfg, task_id, int(task.get("pid") or 0))
+    flash("已发出停止请求：正常情况下 1~2 秒内停；"
+          "若当前阶段不配合，12 秒后会自动强制结束。已完成的进度全部保留。",
+          "warning")
+
+
+def _start_stop_watchdog(cfg: Config, task_id: str, pid: int, grace: float = 12.0) -> None:
+    """12 秒后进程还在 → 杀进程树 + 收尾为 cancelled。在后台线程里做，不阻塞界面。"""
+    import threading
+
+    def _watch() -> None:
+        import subprocess
+        import time as _t
+
+        _t.sleep(grace)
+        if not T._pid_alive(pid):
+            return
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:  # noqa: BLE001
+            pass
+        for _ in range(10):
+            if not T._pid_alive(pid):
+                break
+            _t.sleep(0.5)
+        try:
+            T.finish(cfg, task_id, "cancelled",
+                     message="已停止（强制结束：当前阶段未响应停止请求）")
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_watch, name=f"stop-watch-{task_id}", daemon=True).start()
 
 
 def recent_tasks(cfg: Config, days: int = 30, limit: int = 100) -> List[Dict[str, Any]]:
@@ -204,20 +243,25 @@ def progress_block(task: Dict[str, Any], *, compact: bool = False,
 
 @st.fragment(run_every=f"{POLL_SEC}s")
 def live_task_fragment(cfg: Config, *, compact: bool = True) -> None:
-    """侧边栏的「当前任务」。运行中自动刷新；结束后自动整页刷新一次。"""
+    """侧边栏的「当前任务」。运行中自动刷新；结束的那一轮整页刷新一次。
+
+    注意：只刷新**不跳转**（用户明确表示不需要自动切到照片墙）。
+    """
     T.init(cfg)
     task = T.running(cfg)
+    was = st.session_state.get("_live_state")
     if task is None:
+        if was in ("queued", "running"):
+            # 任务刚结束：整页重算一次，让照片墙/统计/按钮状态跟着变
+            st.session_state["_live_state"] = None
+            st.rerun(scope="app")
+            return
         st.caption("空闲")
         return
-    was = st.session_state.get("_live_state")
     now = task.get("state")
     progress_block(task, compact=compact,
                    on_stop=lambda: stop_task(cfg, task["task_id"]))
     st.session_state["_live_state"] = now
-    if was in ("queued", "running") and now in ("success", "failed", "cancelled"):
-        # 任务刚结束：整页重算（数字、照片墙、按钮状态都要跟着变）
-        st.rerun(scope="app")
 
 
 @st.fragment(run_every=f"{WATCH_SEC}s")

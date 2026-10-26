@@ -74,7 +74,11 @@ def probe_inode_stability(root: Path, cfg: Config) -> InodeProbe:
         except OSError as exc:
             return InodeProbe(False, f"无法 stat {probe_target}：{exc}")
         if not getattr(st, "st_ino", 0):
-            return InodeProbe(False, "st_ino 为 0（文件系统不提供 inode）", str(probe_target))
+            # 根目录本身 st_ino 为 0 的情况少见；更常见的是 **文件** 的
+            # DirEntry.stat().st_ino 为 0 而 os.stat() 有值 —— 那种情况
+            # walk_media 会补一次 os.stat，所以这里仍算「可用」。
+            return InodeProbe(True, "根目录 st_ino 为 0；文件侧改用 os.stat 取 inode",
+                              str(probe_target))
         return InodeProbe(True, "st_ino 可用", str(probe_target))
     st = root.stat()
     return InodeProbe(bool(getattr(st, "st_ino", 0)), "posix st_ino")
@@ -161,12 +165,21 @@ def walk_media(root: Path, cfg: Config, *, limit: Optional[int] = None,
                 rel = os.path.relpath(abs_path, str(root))
             except ValueError:
                 rel = entry.name
+            ino = int(getattr(st, "st_ino", 0) or 0)
+            if ino == 0:
+                # 本机实测：Windows 上 DirEntry.stat() 的 st_ino 恒为 0，
+                # 而 os.stat() 能拿到真 inode（NTFS 文件索引）。移动/改名识别
+                # 全靠它，所以必须补这一次 stat —— 只对 st_ino=0 的文件付代价。
+                try:
+                    ino = int(os.stat(entry.path, follow_symlinks=follow).st_ino or 0)
+                except OSError:
+                    ino = 0
             yield FoundFile(
                 path=str(Path(abs_path)),
                 rel_path=rel,
                 size=int(st.st_size),
                 mtime=int(st.st_mtime),
-                inode=int(getattr(st, "st_ino", 0) or 0),
+                inode=ino,
                 ext=ext,
                 kind=kind,
             )
@@ -195,6 +208,39 @@ class Classification:
             MOVED: len(self.moved),
             UNCHANGED: len(self.unchanged),
         }
+
+
+def _match_other_root(conn, f, root_s: str) -> Optional[int]:
+    """在**其他素材根**里找「同一份文件」的旧记录（移动/改名 + 跨根）。
+
+    判定条件（三者同时满足才认）：
+      * size、mtime 完全相同，文件名相同（忽略大小写）；
+      * 旧路径在磁盘上已经不存在 —— 没有这一条就会把「真副本」误当移动，
+        导致原件记录被抢走，副本反而指向不存在的路径。
+
+    走 idx_files_size 索引；每个「新增」文件最多扫 50 个同尺寸候选。
+    """
+    name = os.path.basename(f.path).lower()
+    try:
+        cands = conn.execute(
+            "SELECT file_id, path, mtime FROM files "
+            "WHERE size=? AND (root IS NULL OR root <> ?) LIMIT 50",
+            (f.size, root_s)).fetchall()
+    except Exception:  # noqa: BLE001 - 匹配失败最多是「少认一次移动」，不该让扫描失败
+        return None
+    for c in cands:
+        try:
+            if int(c[2] or 0) != int(f.mtime):
+                continue
+            old_path = str(c[1] or "")
+            if os.path.basename(old_path).lower() != name:
+                continue
+            if not old_path or os.path.exists(old_path):
+                continue
+            return int(c[0])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def classify(
@@ -233,7 +279,16 @@ def classify(
         if ino:
             by_inode.setdefault(int(ino), []).append(fid)
     by_size_mtime: Dict[Tuple[int, int], List[int]] = {}
+    # 指纹索引：size + mtime + 文件名。用于 **inode 不可用**时识别移动/改名。
+    # 只认「唯一命中，且该记录的原路径在磁盘上已经不存在」——否则复制出来的
+    # 副本会被误认成「移动」，把原记录挪到新位置。
+    by_fingerprint: Dict[Tuple[int, int, str], List[int]] = {}
     for fid, row in files_table.items():
+        if row["size"] is None or row["mtime"] is None or not row["path"]:
+            continue
+        key = (int(row["size"]), int(row["mtime"]),
+               os.path.basename(str(row["path"])).lower())
+        by_fingerprint.setdefault(key, []).append(fid)
         if row["size"] is not None and row["mtime"] is not None:
             by_size_mtime.setdefault((int(row["size"]), int(row["mtime"])), []).append(fid)
 
@@ -262,10 +317,24 @@ def classify(
                     result.modified.append(f)
                 continue
 
-        if inode_stable and f.inode:
+        if f.inode:
             cands = [c for c in by_inode.get(f.inode, []) if c not in claimed]
             if len(cands) == 1:
                 fid = cands[0]
+                claimed.add(fid)
+                result.seen_file_ids.add(fid)
+                result.moved.append((f, fid))
+                continue
+
+        # inode 拿不到（本机老数据全是 0）或用不上时，退到指纹匹配。
+        # 判据：size+mtime+同名 唯一命中，且那条记录的原路径已经不在磁盘上
+        # → 就是这个文件被移动/改名了。
+        fkey = (f.size, f.mtime, os.path.basename(f.path).lower())
+        fp_cands = [c for c in by_fingerprint.get(fkey, []) if c not in claimed]
+        if len(fp_cands) == 1:
+            fid = fp_cands[0]
+            old_path = str(files_table[fid]["path"] or "")
+            if old_path and not os.path.exists(old_path):
                 claimed.add(fid)
                 result.seen_file_ids.add(fid)
                 result.moved.append((f, fid))
@@ -281,6 +350,19 @@ def classify(
                 continue
 
         result.new.append(f)
+
+    # 跨素材根：new 里可能其实是「从别的根挪过来的」。老路径已不存在才算移动。
+    if result.new:
+        kept: List[FoundFile] = []
+        for f in result.new:
+            other = _match_other_root(conn, f, root_s)
+            if other is not None and other not in claimed:
+                claimed.add(other)
+                result.seen_file_ids.add(other)
+                result.moved.append((f, other))
+            else:
+                kept.append(f)
+        result.new = kept
 
     if inode_mismatch is not None:
         inode_mismatch.append(mismatch)
@@ -396,6 +478,12 @@ def apply_classification(
             continue
         # 刷新 path_index 的 mtime/size（可能因 FAT 取整而变化，但内容未变）
         D.upsert_path_index(conn, root_s, make_path_hash(f.rel_path), fid, f.inode, f.mtime, f.size)
+        # 历史遗留：早期扫描把 inode 全存成 0（DirEntry.stat 的坑），
+        # 这里遇到就顺手补上，之后同一文件的移动/改名才能被认出来。
+        if f.inode:
+            conn.execute(
+                "UPDATE files SET inode=? WHERE file_id=? AND (inode IS NULL OR inode=0)",
+                (f.inode, fid))
         # 软删复活：上次扫描时文件不在，这次又在了 → 撤销 missing，重新排队走管线
         revived = conn.execute(
             "UPDATE files SET status='pending', updated_at=? WHERE file_id=? AND status='missing'",
@@ -403,6 +491,10 @@ def apply_classification(
         ).rowcount
         if revived:
             stats["revived"] = stats.get("revived", 0) + 1
+            # 文件回来了，之前跟着软删的人脸也一起恢复（记录与向量一直都在）
+            conn.execute(
+                "UPDATE face_records SET status='alive' "
+                "WHERE file_id=? AND status='missing'", (fid,))
 
     # 删除：库有但磁盘无 → status=missing，软删
     # 注意：必须用「本次扫描确实在磁盘上见到的 file_id」集合做差集。
@@ -456,6 +548,11 @@ def apply_classification(
             if not dry_run:
                 conn.execute("UPDATE files SET status='missing', updated_at=? WHERE file_id=?",
                              (now, fid))
+                # 同步软删它的人脸记录：否则缩略图还在 nvme 里，墙上照旧显示，
+                # 用户点「打开所在文件夹」才发现原文件没了 —— 2026-10-22 的真实反馈。
+                conn.execute(
+                    "UPDATE face_records SET status='missing' "
+                    "WHERE file_id=? AND status='alive'", (fid,))
     if not dry_run:
         D.upsert_library(conn, root_s, last_scan=now, status="idle")
 
@@ -564,6 +661,19 @@ def run(args, cfg: Config) -> Dict[str, Any]:
     if getattr(args, "reprocess_all", False):
         stats["reprocess_reset"] = reset_for_full_reprocess(
             conn, cfg, dry_run=args.dry_run)
+    # 扫描改变了「文件路径 / 状态」，必须让界面缓存失效。
+    # 原来只有走任务队列（run_task）时才写事件，命令行直接跑 01_manifest.py
+    # 不写事件 → 界面的照片墙/搜索/人脸分组缓存最多陈旧 3 分钟（ttl），
+    # 用户看到的就是「明明扫过了，地址还是旧的」。
+    if not args.dry_run:
+        try:
+            T.emit(cfg, "library_changed",
+                   {"reason": "manifest", "root": str(root),
+                    "new": stats.get("new", 0), "moved": stats.get("moved", 0),
+                    "modified": stats.get("modified", 0),
+                    "missing": stats.get("missing", 0)})
+        except Exception as exc:  # noqa: BLE001 - 事件写失败不该让扫描失败
+            LOG.warning("写变更事件失败（界面缓存可能延迟刷新）：%s", exc)
     conn.close()
 
     total_bytes = sum(f.size for f in files)

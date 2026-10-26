@@ -1,0 +1,27 @@
+# =============================================================================
+# .gitattributes · 行尾统一
+#
+# 为什么需要：Windows 上 core.autocrlf 的默认行为会让每次 checkout 都改动行尾，
+# 造成「没改代码也有 diff」。而且 start.bat **必须是 CRLF**，否则 cmd.exe 解析失败
+# （LF-only 的 .bat 会让多行粘成一行，表现为窗口一闪而过）。
+# =============================================================================
+
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 二进制：不要做行尾/编码转换
+*.db     binary
+*.onnx   binary
+*.safetensors binary
+*.parquet binary
+*.npy    binary
+*.webp   binary
+*.jpg    binary
+*.jpeg   binary
+*.png    binary
+*.mp4    binary
+*.mov    binary
+*.docx   binary

@@ -47,6 +47,8 @@ ACTIVE_STATES = ("queued", "running")
 TERMINAL_STATES = ("success", "failed", "cancelled")
 
 STALE_MIN = 5            # running 行超过这么久没心跳 → 进程已死
+# 长视频解码期间也要把「正在处理」写出去（否则界面像卡死）
+CURRENT_FLUSH_INTERVAL = 4.0
 PROGRESS_MIN_INTERVAL = 1.0   # 进度写库最小间隔（秒）
 CANCEL_POLL_INTERVAL = 3.0    # 取消标志轮询间隔（秒）
 HISTORY_DAYS = 30
@@ -72,7 +74,8 @@ def _connect(cfg: Optional[Config] = None, *, timeout: float = 60.0) -> sqlite3.
     conn = sqlite3.connect(str(cfg.db_path), timeout=timeout, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-    conn.execute("PRAGMA journal_mode=WAL")
+    # 不要在这里执行 PRAGMA journal_mode=WAL：库早已是 WAL，而这个 pragma
+    # 仍需短暂获取写锁。界面每次渲染都会建好几个连接，白付的锁竞争代价很大。
     return conn
 
 
@@ -145,6 +148,7 @@ def update(cfg: Optional[Config], task_id: str, **fields: Any) -> None:
     allowed = {
         "state", "stage", "stage_ix", "stage_total", "done", "total", "message",
         "error", "pid", "cancel", "started_at", "finished_at", "updated_at", "title",
+        "stage_started_at",
     }
     use = {k: v for k, v in fields.items() if k in allowed}
     if not use:
@@ -244,58 +248,249 @@ def elapsed_sec(task: Dict[str, Any]) -> Optional[float]:
     return max(0.0, (t1 - t0).total_seconds())
 
 
+def _stage_elapsed_sec(task: Dict[str, Any]) -> Optional[float]:
+    """当前阶段已经跑了多久（没有 stage_started_at 的老任务退回整个任务时间）。"""
+    base = task.get("stage_started_at") or task.get("started_at")
+    if not base:
+        return None
+    try:
+        t0 = datetime.fromisoformat(str(base))
+    except ValueError:
+        return None
+    end = task.get("finished_at")
+    t1 = datetime.fromisoformat(end) if end else datetime.now()
+    return max(0.0, (t1 - t0).total_seconds())
+
+
 def snapshot(task: Dict[str, Any]) -> Dict[str, Any]:
     """给界面用的派生量：速率、预计剩余、是否停滞。"""
     done = int(task.get("done") or 0)
     total = task.get("total")
     el = elapsed_sec(task) or 0.0
-    rate = (done / el) if el > 1 and done else None
+    # 速度必须用「**当前阶段**已用时间」，不能用整个任务的时间：
+    # done 每切阶段就归零，分母却一直累加 → 速度被前几个阶段的时间拉低，
+    # ETA 随之虚高；刚切阶段时还会出现「速度≈0、剩余几十小时」。
+    el_stage = _stage_elapsed_sec(task) or 0.0
+    rate = (done / el_stage) if el_stage > 1 and done else None
     eta = None
-    if rate and total and done and total > done:
+    if rate and total and total > done:
         eta = (total - done) / rate
     return {
         **task,
         "elapsed_sec": el,
+        "stage_elapsed_sec": el_stage,
         "rate": rate,
         "eta_sec": eta,
         "is_active": task.get("state") in ACTIVE_STATES,
     }
 
 
-def reap_stale(cfg: Optional[Config], minutes: int = STALE_MIN) -> int:
-    """把心跳超时的 running 任务判为失败（进程被强杀后的兜底）。"""
-    cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
-    conn = _connect(cfg)
+def _pid_alive(pid: Any) -> bool:
+    """这个进程还活着吗？**心跳判定必须问它**，不能只看时间戳。
+
+    2026-10-20 误判：单个大视频抽帧可以合法地连续 10 分钟没有 tick
+    （video.single_video_timeout_sec=600），只看时间戳就会把活着的任务判死。
+    """
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def pid_looks_like_task(pid: Any, task_id: Optional[str] = None) -> bool:
+    """这个 pid 现在还是「那个任务的流水线进程」吗？
+
+    光看 `_pid_alive()` 不够：Windows 会复用 PID。实测 2026-10-26，
+    一个 2 天前失败任务的 pid 已经被 msedgewebview2.exe 占用，
+    于是僵尸守卫每次都命中，**所有任务按钮都点不动**。
+
+    判据：命令行里同时出现 `run_task.py`（或 01_/03_/04_/06_/07_ 阶段脚本）
+    与 task_id。取不到命令行时保守返回 True（宁可误拦也不并发跑两份）。
+    """
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    try:
+        import psutil  # type: ignore
+
+        cmd = " ".join(psutil.Process(pid).cmdline())
+    except Exception:  # noqa: BLE001 - 没有 psutil / 没权限：保守一点
+        return True
+    if not cmd:
+        return True
+    markers = ("run_task.py", "01_manifest.py", "03_extract.py", "04_encode.py",
+               "06_face_detect.py", "07_face_encode.py", "16_cluster.py",
+               "17_gold.py", "18_reconcile.py", "12_maintain.py")
+    if not any(m in cmd for m in markers):
+        return False
+    if task_id and str(task_id) not in cmd:
+        return False
+    return True
+
+
+def clear_reused_pids(cfg: Optional[Config] = None) -> int:
+    """把「终态任务但 pid 已被别的进程占用」的记录清空 pid（一次性清理）。"""
+    try:
+        conn = _connect(cfg, timeout=5.0)
+    except sqlite3.Error:
+        return 0
+    n = 0
     try:
         rows = conn.execute(
-            "SELECT task_id FROM tasks WHERE state='running' AND updated_at < ?", (cutoff,)
-        ).fetchall()
-        n = len(rows)
+            "SELECT task_id, pid FROM tasks WHERE pid IS NOT NULL "
+            "AND state IN ('success','failed','cancelled') "
+            "ORDER BY created_at DESC LIMIT 60").fetchall()
+        for r in rows:
+            if _pid_alive(r["pid"]) and not pid_looks_like_task(r["pid"], r["task_id"]):
+                conn.execute("UPDATE tasks SET pid=NULL WHERE task_id=?", (r["task_id"],))
+                n += 1
         if n:
-            now = local_now_iso()
-            conn.execute(
-                "UPDATE tasks SET state='failed', finished_at=?, updated_at=?, "
-                "message='进程已退出（未正常结束）', error='heartbeat timeout' "
-                "WHERE state='running' AND updated_at < ?", (now, now, cutoff),
-            )
+            conn.commit()
+    except sqlite3.Error:
+        pass
     finally:
         conn.close()
     return n
 
 
-def purge_history(cfg: Optional[Config], days: int = HISTORY_DAYS) -> Dict[str, int]:
-    """删除 30 天前的终态任务与事件（规格 §3.2 保留 30 天）。"""
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    conn = _connect(cfg)
+def live_terminal_tasks(cfg: Optional[Config], *, within_min: int = 1440) -> List[Dict[str, Any]]:
+    """状态已是终态、但进程还活着的任务（说明当初判错了，或进程没被回收）。"""
+    conn = _connect(cfg, timeout=5.0)
     try:
-        n1 = conn.execute(
-            "DELETE FROM tasks WHERE state IN ('success','failed','cancelled') "
-            "AND created_at < ?", (cutoff,)
-        ).rowcount
-        n2 = conn.execute("DELETE FROM task_events WHERE at < ?", (cutoff,)).rowcount
+        rows = conn.execute(
+            "SELECT task_id, title, state, pid, updated_at FROM tasks "
+            "WHERE state IN ('failed','cancelled') AND pid IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 20").fetchall()
+    except sqlite3.Error:
+        return []
     finally:
         conn.close()
-    return {"tasks": n1, "events": n2}
+    return [dict(r) for r in rows if pid_looks_like_task(r["pid"], r["task_id"])]
+
+
+def stale_minutes(cfg: Optional[Config] = None) -> int:
+    """心跳超时阈值。必须比「单个文件最长合法耗时」大得多。
+
+    视频侧 `video.single_video_timeout_sec` 默认 600 秒 = 10 分钟，
+    这期间抽帧线程不会 tick，所以阈值至少 15 分钟。
+    """
+    base = 15
+    try:
+        cfg = cfg or _CFG_HOLDER[0]
+        if cfg is not None:
+            base = int(cfg.get("task.stale_minutes", 15))
+            one = float(cfg.get("video.single_video_timeout_sec", 600)) / 60.0
+            base = max(base, int(one) + 5)
+    except Exception:  # noqa: BLE001
+        pass
+    return max(5, base)
+
+
+def reap_stale(cfg: Optional[Config], minutes: Optional[int] = None) -> int:
+    """把心跳超时的 running 任务判为失败（进程被强杀后的兜底）。
+
+    ⚠️ 这个函数在**每次页面渲染**时都会被调用（由 active_task 触发），
+    所以绝不能一上来就写库：抽帧进程持有写事务时，UPDATE 会排队等锁，
+    用户感受就是「切个页面卡好几秒」。先做只读探测（WAL 下读不阻塞写），
+    确认真有僵尸才付出一次 UPDATE 的代价。
+    """
+    minutes = int(minutes if minutes is not None else stale_minutes(cfg))
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        conn = _connect(cfg, timeout=2.0)
+        try:
+            # 先处理「用户已经点了停止、进程也已经不在」的任务：
+            # 这种任务永远不会再写心跳，等 15 分钟才收尾会让界面卡在「正在停止…」。
+            grace = (datetime.now() - timedelta(seconds=15)).strftime("%Y-%m-%dT%H:%M:%S")
+            cancel_rows = conn.execute(
+                "SELECT task_id, pid FROM tasks WHERE state='running' AND cancel=1 "
+                "AND updated_at < ?", (grace,)).fetchall()
+            stopped = [r["task_id"] for r in cancel_rows if not _pid_alive(r["pid"])]
+            if stopped:
+                now_c = local_now_iso()
+                conn.executemany(
+                    "UPDATE tasks SET state='cancelled', finished_at=?, updated_at=?, "
+                    "message='已停止' WHERE task_id=?",
+                    [(now_c, now_c, t) for t in stopped])
+            rows = conn.execute(
+                "SELECT task_id, pid FROM tasks WHERE state='running' AND updated_at < ?",
+                (cutoff,)).fetchall()
+            if not rows:
+                return len(stopped)
+            # 关键：心跳旧 ≠ 进程死。视频抽帧可以合法地 10 分钟不 tick。
+            dead = [r["task_id"] for r in rows if not _pid_alive(r["pid"])]
+            alive = [r["task_id"] for r in rows if _pid_alive(r["pid"])]
+            if alive:
+                # 进程还活着：只把心跳往前推，别动状态
+                now0 = local_now_iso()
+                conn.executemany(
+                    "UPDATE tasks SET updated_at=? WHERE task_id=?",
+                    [(now0, t) for t in alive])
+            if not dead:
+                return 0
+            now = local_now_iso()
+            conn.executemany(
+                "UPDATE tasks SET state='failed', finished_at=?, updated_at=?, "
+                "message='进程已退出（未正常结束）', error='heartbeat timeout' "
+                "WHERE task_id=?", [(now, now, t) for t in dead])
+            return len(dead)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # 拿不到写锁（流水线正忙）就放弃：下次渲染会再试，僵尸任务不影响正确性
+        return 0
+
+
+def purge_history(cfg: Optional[Config], days: int = HISTORY_DAYS) -> Dict[str, Any]:
+    """删除 30 天前的终态任务与事件（规格 §3.2 保留 30 天）。
+
+    注意：这是**写操作**。抽帧/编码正在写库时它可能拿不到锁，所以：
+      * 用 5 秒超时（不是默认 60 秒 —— 让用户干等一分钟再报错毫无意义）；
+      * 拿不到锁就返回 {"error": ...}，由界面显示人话提示。
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        conn = _connect(cfg, timeout=5.0)
+        try:
+            n1 = conn.execute(
+                "DELETE FROM tasks WHERE state IN ('success','failed','cancelled') "
+                "AND created_at < ?", (cutoff,)
+            ).rowcount
+            n2 = conn.execute("DELETE FROM task_events WHERE at < ?", (cutoff,)).rowcount
+            return {"tasks": n1, "events": n2}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"tasks": 0, "events": 0,
+                "error": f"数据库正忙（{type(exc).__name__}），请等当前任务结束后再清理。"}
 
 
 # --------------------------------------------------------------------------- #
@@ -392,11 +587,13 @@ class Reporter:
         # 会把子进程刚报完的进度冲成 0 —— 2026-10-19 实测踩到过。
         self._owns = False
         self._skipped = 0      # 进度因写锁被跳过的次数（只用于诊断）
+        self._current = ""     # 正在处理的文件（只放内存，跟 tick 一起 flush）
 
     # -- 生命周期 -------------------------------------------------------- #
     def start(self) -> None:
         update(self.cfg, self.task_id, state="running", pid=os.getpid(),
-               started_at=local_now_iso(), message="开始执行")
+               started_at=local_now_iso(), stage_started_at=local_now_iso(),
+               message="开始执行")
         emit(self.cfg, "task_state", {"task_id": self.task_id, "state": "running"},
              task_id=self.task_id)
         self._last_write = time.monotonic()
@@ -409,7 +606,8 @@ class Reporter:
         self._done = 0
         self._total = total
         self._owns = total is not None
-        f: Dict[str, Any] = {"stage": name, "done": 0, "total": total, "message": name}
+        f: Dict[str, Any] = {"stage": name, "done": 0, "total": total, "message": name,
+                             "stage_started_at": local_now_iso()}
         if n:
             f["stage_ix"] = ix
             f["stage_total"] = n
@@ -420,6 +618,20 @@ class Reporter:
         self._message = msg
         update(self.cfg, self.task_id, message=msg[:500])
         self._last_write = time.monotonic()
+
+    def current(self, item: str) -> None:
+        """记下「正在处理」的是哪个文件。
+
+        每 4 秒才真正写一次库（避免抢写锁），但**大视频期间必须能写出去**：
+        `tick()` 是每个文件结束后才调，一个 9 分钟 1.5GB 的视频解码要几分钟，
+        期间界面既没有进度也没有文件名，用户会以为卡死
+        （2026-10-23 实际反馈：「一直显示估算中…已用 55 秒」）。
+        顺带把这次写入当心跳，长视频也不会被误判为心跳超时。
+        """
+        self._current = str(item or "")[:500]
+        now = time.monotonic()
+        if (now - self._last_write) >= CURRENT_FLUSH_INTERVAL:
+            self._flush(now)
 
     def tick(self, n: int = 1, *, total: Optional[int] = None, force: bool = False) -> None:
         """累加进度。抽帧/编码/检脸的循环里每处理一个文件调一次。"""
@@ -444,7 +656,8 @@ class Reporter:
         任务完成/失败这种关键写入仍走 60 秒超时。
         """
         now = now or time.monotonic()
-        f: Dict[str, Any] = {"message": (self._message or self._stage or "")[:500]}
+        msg = f"正在处理：{self._current}" if self._current else (self._message or self._stage or "")
+        f: Dict[str, Any] = {"message": msg[:500]}
         if self._owns if with_progress is None else with_progress:
             f["done"] = self._done
             f["total"] = self._total
@@ -546,6 +759,13 @@ def say(msg: str) -> None:
     rep = _REPORTER[0]
     if rep is not None:
         rep.say(msg)
+
+
+def current(item: str) -> None:
+    """告知「正在处理这个文件」（只记内存，不写库）。"""
+    rep = _REPORTER[0]
+    if rep is not None:
+        rep.current(item)
 
 
 def cancelled() -> bool:

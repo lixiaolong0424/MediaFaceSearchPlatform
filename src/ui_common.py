@@ -78,3 +78,36 @@ def fmt_rate(rate: Optional[float], unit: str = "个文件") -> str:
     if rate >= 1:
         return f"{rate:.1f} {unit}/秒"
     return f"{rate*60:.1f} {unit}/分钟"
+
+
+def open_folder(abs_path: str) -> str:
+    """在资源管理器里定位文件。成功返回 ''，失败返回文案。
+
+    坑（2026-10-19 修）：`Popen(["explorer", "/select,"+p], shell=True)` 会把路径
+    拼进命令行，空格/中文/&() 一旦破坏解析，explorer 就退回默认目录（文档）。
+    这里不用 shell，整条命令行自己拼，路径用双引号包住。
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    p_ = Path(abs_path)
+    if not p_.exists():
+        return f"文件不存在：{abs_path}"
+    if os.name != "nt":
+        try:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open",
+                              str(p_.parent)])
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            return f"打开失败：{exc}"
+    try:
+        subprocess.Popen(f'explorer /select,"{p_}"', shell=False)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        try:
+            os.startfile(str(p_.parent))  # type: ignore[attr-defined]
+            return ""
+        except Exception as exc2:  # noqa: BLE001
+            return f"打开失败：{exc} / {exc2}"

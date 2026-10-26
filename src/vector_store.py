@@ -278,6 +278,68 @@ class QdrantVectorStore(VectorStore):
         )
         return before
 
+    def delete_by_files(self, collection: str, file_ids: Sequence[int]) -> int:
+        """一次请求删掉一批 file_id 的所有点。
+
+        为什么要有它：`delete_by_file` 每个文件要 2 次往返（count + delete），
+        1700 个文件就是 6800 次 HTTP，慢到 0.6 条/秒。
+        这里用 MatchAny 一次删 2000 个 file_id，且**不做 count**
+        （调用方只需要"删掉"这个结果，不需要精确返回值）。
+        """
+        from qdrant_client import models as qm
+
+        ids = [int(x) for x in file_ids if x is not None]
+        if not ids:
+            return 0
+        try:
+            if not self._client.collection_exists(collection):
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._client.delete(
+                collection_name=collection,
+                points_selector=qm.FilterSelector(
+                    filter=qm.Filter(must=[qm.FieldCondition(
+                        key="file_id", match=qm.MatchAny(any=ids))])),
+                wait=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("批量删除向量失败 collection=%s n=%d：%s", collection, len(ids), exc)
+            return 0
+        return len(ids)
+
+    def delete_ids(self, collection: str, point_ids: Sequence[int],
+                   *, batch: int = 5000) -> int:
+        """按点 ID 批量删除（比按 file_id 过滤快一个数量级）。
+
+        Qdrant 的过滤删除要扫全部分类的 payload；点 ID 删除是索引定位。
+        实测：1,272 文件用过滤删要 176 秒，改点 ID 后是秒级。
+        """
+        from qdrant_client import models as qm
+
+        ids = [int(x) for x in point_ids]
+        if not ids:
+            return 0
+        try:
+            if not self._client.collection_exists(collection):
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
+        n = 0
+        for i in range(0, len(ids), batch):
+            chunk = ids[i:i + batch]
+            try:
+                self._client.delete(
+                    collection_name=collection,
+                    points_selector=qm.PointIdsList(points=chunk),
+                    wait=True)
+                n += len(chunk)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("按 ID 删向量失败 collection=%s n=%d：%s",
+                            collection, len(chunk), exc)
+        return n
+
     def count(self, collection: str, *, file_id: Optional[int] = None) -> int:
         from qdrant_client import models as qm
 

@@ -84,4 +84,5 @@ screenshots/
 tmp/tmp*/
 tmp/*.jpg
 tmp/*.png
-
+# ---------- 临时脚本目录（诊断脚本请归 tools/，这里只放一次性产物）----------
+tmp/

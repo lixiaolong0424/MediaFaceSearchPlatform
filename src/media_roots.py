@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -23,6 +24,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from . import db as D
+LOG = logging.getLogger("media_roots")
+
 from .common import CONFIG_LOCAL_FILENAME, Config, local_now_iso
 
 KEY = "media_roots"
@@ -168,9 +171,16 @@ def add(cfg: Config, path: str, *, label: str = "", who: str = "界面") -> Dict
     if not ok:
         raise ValueError(msg)
     entries = _entries(cfg)
+    old_entries = [dict(e) for e in entries]
     entries.append({"path": normalize(path), "enabled": True, "label": label})
     _write(cfg, entries)
-    _register(cfg, path, who=who, action="add")
+    try:
+        _register(cfg, path, who=who, action="add")
+    except Exception:
+        # 登记失败（数据库忙/权限）→ 把配置文件回滚，避免出现
+        # 「配置里有这个目录、libraries 里却没有」的幽灵项。
+        _write(cfg, old_entries)
+        raise
     _emit(cfg)
     return {"added": normalize(path), "count": len(entries)}
 
@@ -201,9 +211,15 @@ def update(cfg: Config, old_path: str, *, new_path: Optional[str] = None,
     return {"updated": entries[idx]}
 
 
-def remove(cfg: Config, path: str, *, purge: bool = False,
+def remove(cfg: Config, path: str, *, purge: bool = True,
            who: str = "界面") -> Dict[str, Any]:
-    """从列表移除。purge=False（默认）只移除登记，数据一条不删。"""
+    """从「素材文件夹」里移除。
+
+    默认 **purge=True**：把这个目录下的记录与向量从库里彻底删掉
+    （磁盘上的原文件不动，铁律 2）。这与「停用」形成明确分工：
+        停用 = 不显示、不搜索、不扫描，数据全留（可一键恢复）
+        移除 = 数据从库里消失（不可撤销，除非重新扫描）
+    """
     entries = _entries(cfg)
     keep = [e for e in entries if not _same(e["path"], path)]
     if len(keep) == len(entries):
@@ -225,15 +241,17 @@ def purge_root(cfg: Config, path: str) -> int:
     """物理删除某目录下的**记录与向量**。磁盘上的原文件绝不碰（铁律 2）。"""
     from .migrate import _purge_rows
 
-    pref = prefix_of(path)
+    clause, params = _root_conditions(path)
     conn = D.connect(cfg.db_path, cfg=cfg)
     try:
         rows = conn.execute(
-            "SELECT file_id, path, kind FROM files WHERE root=? OR path LIKE ?",
-            (pref, pref + "%")).fetchall()
+            f"SELECT file_id, path, kind FROM files WHERE ({clause})", params).fetchall()
         gone = [(int(r["file_id"]), str(r["path"]), str(r["kind"])) for r in rows]
         n = _purge_rows(cfg, conn, gone) if gone else 0
-        conn.execute("DELETE FROM path_index WHERE root=?", (pref,))
+        rows_roots = {str(r["root"] or "") if "root" in r.keys() else "" for r in rows}
+        for pref in rows_roots | {prefix_of(path)}:
+            if pref:
+                conn.execute("DELETE FROM path_index WHERE root=?", (pref,))
         conn.commit()
     finally:
         conn.close()
@@ -241,8 +259,71 @@ def purge_root(cfg: Config, path: str) -> int:
     return n
 
 
-def set_enabled(cfg: Config, path: str, enabled: bool) -> Dict[str, Any]:
-    return update(cfg, path, enabled=enabled)
+def _root_conditions(path: str | Path) -> tuple[str, list]:
+    """构造「属于这个素材根」的 SQL 条件（同时覆盖 8.3 短名与长名两种写法）。
+
+    files.root 是扫描时的写法，调用者给的 path 可能是另一种写法；
+    只按一种写去匹配会一行都命中不了（实测就是这么坏的）。
+    """
+    cands: list[str] = []
+    try:
+        cands.append(prefix_of(path))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        long_form = normalize(path).replace("/", os.sep)
+        cands.append(prefix_of(long_form))
+    except Exception:  # noqa: BLE001
+        pass
+    seen: list[str] = []
+    for c in cands:
+        if c and c not in seen:
+            seen.append(c)
+    if not seen:
+        return "0", []
+    clause = " OR ".join(["(root=? OR path LIKE ?)"] * len(seen))
+    params: list = []
+    for c in seen:
+        params.extend([c, c + "%"])
+    return clause, params
+
+
+def set_enabled(cfg: Config, path: str, enabled: bool,
+                who: str = "界面") -> Dict[str, Any]:
+    """启用 / 停用。停用后该目录下的素材**在系统里不再显示、也不参与检索**。
+
+    为什么改 files.visible 而不是只改登记：检索（Qdrant）是按向量召回、
+    再回 SQLite 取元数据；只要 SQLite 这一步把 visible=0 的行过滤掉，
+    停用的目录自然从搜索、照片墙、人脸分组、统计里一起消失，
+    不需要清 Qdrant，也不需要任何数据迁移 —— 重新启用只是把 visible 置回 1。
+    """
+    res = update(cfg, path, enabled=enabled, who=who)
+    clause, params = _root_conditions(path)
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        if enabled:
+            # 恢复可见；但重复文件（skipped_dup）本来就该隐藏，别一起放出来
+            n = conn.execute(
+                f"UPDATE files SET visible=1 WHERE ({clause}) "
+                f"AND status NOT IN ('skipped_dup','missing')", params).rowcount
+        else:
+            n = conn.execute(
+                f"UPDATE files SET visible=0 WHERE ({clause})", params).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    res["visible_rows"] = n
+    pref = prefix_of(path)
+    # 停用/启用会改变「谁能显示」，必须重算分组的人数与封面，
+    # 否则照片墙上还会留着这些组（用户实测反馈过）。
+    try:
+        from . import cluster as C
+
+        res["meta_refreshed"] = C.refresh_meta_for_root(cfg, pref)
+    except Exception as exc:  # noqa: BLE001 - 重算失败不该让停用操作失败
+        LOG.warning("重算分组 meta 失败：%s", exc)
+    _emit(cfg)
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +333,10 @@ def set_enabled(cfg: Config, path: str, enabled: bool) -> Dict[str, Any]:
 
 def _register(cfg: Config, path: str, *, who: str, action: str) -> None:
     pref = prefix_of(path)
-    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        conn = D.connect(cfg.db_path, cfg=cfg)
+    except Exception as exc:
+        raise RuntimeError(f"数据库正忙，稍后再试（{type(exc).__name__}）。") from exc
     try:
         conn.execute(
             "INSERT INTO libraries(root, enabled, added_at, status) VALUES (?,1,?,'idle') "

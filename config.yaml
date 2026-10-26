@@ -35,7 +35,7 @@ db:
 library:
   # ext_whitelist 使用小写；比对时对扩展名 .lower()
   ext_whitelist: [jpg, jpeg, png, webp, mp4, mov, mkv, avi, m4v]
-  photo_ext: [jpg, jpeg, png, webp]
+  photo_ext: [jpg, jpeg, png, webp, heic, heif]   # heic/heif：iPhone 原片，依赖 pillow-heif
   video_ext: [mp4, mov, mkv, avi, m4v]
   # 严格 E:\ 会递归进回收站等目录：按「目录名」黑名单跳过（大小写不敏感、任意深度生效）。
   #
@@ -188,6 +188,9 @@ scan:
 
 dedup:
   # L2a：pHash 感知哈希去重（仅图片）
+  # 视频去重：同 size + 同 mtime + 同文件名 → 判为重复拷贝，只处理一份。
+  # 照片侧有 pHash；视频侧没有感知哈希（代价太高），用这三元组已经足够严格。
+  video_enable: true
   hash_size: 8                   # 64 bit
   hamming_threshold: 8           # 汉明距离 <= 8 视为近重复
   keep_policy: higher_res_newer_mtime
@@ -277,7 +280,9 @@ semantic:
   instruct_query: "检索与输入画面内容相似的视频片段"
   instruct_doc: "Represent the user's image content for retrieval."
   thresh_default: 0.55
-  recall_k: 400
+  recall_k: 400000        # 从 Qdrant 取的候选数。**这是真正的第一道闸门**：
+                        # 填 400 就只能拿到 400 条，后面的 k_hard 再大也没用。
+                        # 想要「返回整库」就设成 ≥ 期望条数（全库约 40 万镜头）。
   # ⚠️ 重排的输入/输出条数不在这里，而在下方 retrieval.rerank_input_k / rerank_topk。
   #    2026-10-16 删掉了这里原本重复的一行 `rerank_topk: 50`：
   #    代码只读 retrieval.rerank_topk，留在这一段等于**假配置**
@@ -335,7 +340,9 @@ faces:
 
 retrieval:
   # 7.2 自适应截断
-  k_hard: 200
+  k_hard: 400000          # 初筛候选上限。**这就是「最多返回几条」的真实天花板**：
+                        # 原来写 200，所以界面填 20000 也只出 200 条。
+                        # 调大=能返回更多、但每次检索更慢（Qdrant 取更多候选）。
   gap_min: 0.03
   # ⚠️ min_score 必须按**模型实际分数空间**标定，规格写的 0.55 在本项目是错的。
   # 2026-10-16 实测（18,506 个向量，9 个查询，k=400）：
@@ -369,7 +376,7 @@ retrieval:
   # 想按规格跑满就设成 400（`05_rerank.py --k 400` 也能这么跑并打印耗时）。
   rerank_enabled: true
   rerank_input_k: 60             # 重排前多少条召回结果（规格：400）
-  rerank_topk: 50                # 规格 8.2：重排后保留 Top-50
+  rerank_topk: 400000            # 重排后保留条数（400000 = 不截断）
   # 重排分空间的阈值。实测重排分 0.14~0.51（p90=0.459 p75=0.427 p10=0.222），
   # 且**能区分**相关/无关，所以这里用绝对阈值才有意义：0.25 约等于 p15，
   # 只滤掉明显无关的，保留大部分。
@@ -382,6 +389,8 @@ retrieval:
   rerank_skip_cosine: 0.85
 
 ui:
+  # 打开软件/刷新页面时先落在哪一页（可在「设置」里改）
+  start_page: search
   host: 127.0.0.1
   port: 8501
   static_port: 18501
@@ -486,3 +495,29 @@ monitor:
 backfill:
   batch_files: 5000             # 每批 <= 5000 个文件（规格 §15.4 强制）
   dry_run_default: true         # 默认只出计划，不执行
+
+# =========================================================================== #
+# 性能 / 全速模式（方案 B）
+#   balanced：默认值，稳妥、占用适中
+#   turbo   ：照片预读 + 视频并发 + 编码批大小 一次性调到激进值
+# 界面上「设置 → 性能 → 全速模式」一键切换，改完不用重启界面。
+# =========================================================================== #
+performance:
+  mode: balanced                 # balanced | turbo
+  photo_prefetch: 0              # 照片预读线程数（0=关闭，turbo 建议 6）
+  photo_prefetch_depth: 12       # 预读队列深度（张）。6.8MB/张 → 12 张约 82MB
+  video_workers: 0               # 0=沿用 video.max_worker_cap；turbo 建议 12
+  encode_batch: 0                # 0=沿用 semantic.batch_size；turbo 建议 32
+  encode_group: 0                # 0=沿用 semantic.group_size；turbo 建议 12
+
+# --- 自动分组：大库保护（2026-10-26 崩溃后加入）--------------------------------
+cluster_extra:
+  # 一次 HDBSCAN 最多拟合多少张脸。超过就先抽样拟合，其余按最近簇心分配。
+  # 30 万点一次性拟合会让进程栈溢出（退出码 3221225725），实测 19.8 万可完成。
+  max_fit_faces: 120000
+  # 抽样外的脸按「到最近簇心的距离」归组：
+  #   阈值 = 簇半径中位数 × assign_dist_factor（自动随数据尺度缩放）
+  assign_dist_factor: 1.6
+  # 绝对上限（0 = 不设上限，只按上面的自适应阈值）
+  assign_max_dist: 0
+  sample_seed: 42

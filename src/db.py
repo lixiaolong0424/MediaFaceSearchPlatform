@@ -250,7 +250,7 @@ def library_stats(conn: sqlite3.Connection, root: str, *,
             return []
 
     by_status = {str(r["status"]): int(r["n"]) for r in safe(
-        "SELECT status, COUNT(*) n FROM files GROUP BY status")}
+        "SELECT status, COUNT(*) n FROM files WHERE visible=1 GROUP BY status")}
 
     # 一次 GROUP BY 拿到「类型 × 状态」全部计数。
     # 原实现是 7 条独立 COUNT（photos / videos / photos_done / videos_done /
@@ -258,7 +258,7 @@ def library_stats(conn: sqlite3.Connection, root: str, *,
     # 合计 4~5 秒 —— 而 Streamlit 每次重跑都要付这个代价（界面就卡住变白）。
     # 配合 migration 004 的 idx_files_kind_status，这条现在走索引。
     by_kind: Dict[str, Dict[str, int]] = {}
-    for r in safe("SELECT kind, status, COUNT(*) n FROM files GROUP BY kind, status"):
+    for r in safe("SELECT kind, status, COUNT(*) n FROM files WHERE visible=1 GROUP BY kind, status"):
         by_kind.setdefault(str(r["kind"]), {})[str(r["status"])] = int(r["n"])
 
     def kcount(kind: str, *statuses: str) -> int:
@@ -273,7 +273,7 @@ def library_stats(conn: sqlite3.Connection, root: str, *,
     for r in safe("SELECT root, last_scan, status FROM libraries ORDER BY last_scan DESC"):
         root_s = str(r["root"])
         like = root_s.rstrip("\\/") + "%"
-        n_files = one("SELECT COUNT(*) FROM files WHERE path LIKE ?", like)
+        n_files = one("SELECT COUNT(*) FROM files WHERE path LIKE ? AND visible=1", like)
         indexed_roots.append({
             "indexed_root": root_s,
             "files": int(n_files),
@@ -284,7 +284,7 @@ def library_stats(conn: sqlite3.Connection, root: str, *,
             continue
         # 顶层目录用 rel_path 的第一段（比按 path 推层级可靠，见 12_maintain.cmd_status 注释）
         counter: Dict[str, int] = {}
-        for row in safe("SELECT rel_path, path FROM files WHERE path LIKE ?", like):
+        for row in safe("SELECT rel_path, path FROM files WHERE path LIKE ? AND visible=1", like):
             text = str(row["rel_path"] or row["path"])
             seg = text.replace("/", "\\").lstrip("\\").split("\\", 1)[0]
             if seg:
@@ -293,7 +293,7 @@ def library_stats(conn: sqlite3.Connection, root: str, *,
             top_dirs.append({"root": root_s, "dir": name, "files": n})
 
     # 下一步建议
-    total = int(one("SELECT COUNT(*) FROM files"))
+    total = int(one("SELECT COUNT(*) FROM files WHERE visible=1"))
     pending = by_status.get("pending", 0)
     done = by_status.get("done", 0)
     enc_done = int(one(

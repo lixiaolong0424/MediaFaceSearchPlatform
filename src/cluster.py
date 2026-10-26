@@ -141,6 +141,86 @@ def reduce_dims(cfg: Config, x: np.ndarray) -> Tuple[np.ndarray, str]:
     return np.asarray(y, dtype=np.float32), "pca"
 
 
+def _assign_by_centroid(cfg: Config, y: np.ndarray, labels: np.ndarray,
+                        fit_idx: np.ndarray, target: np.ndarray) -> int:
+    """把 target 里的点按「最近簇心 + 分位数半径」并入 labels，返回归入数量。"""
+    order = [c for c in sorted({int(v) for v in labels[fit_idx]}) if c >= 0]
+    if not order:
+        return 0
+    pts = y[fit_idx]
+    cents = np.stack([pts[labels[fit_idx] == c].mean(axis=0) for c in order]).astype(np.float32)
+    q = float(cfg.get("cluster.assign_radius_quantile", 0.95))
+    factor = float(cfg.get("cluster.assign_dist_factor", 1.2) or 1.2)
+    radii = []
+    for i, c in enumerate(order):
+        d = np.sqrt(((pts[labels[fit_idx] == c] - cents[i]) ** 2).sum(axis=1))
+        radii.append(float(np.quantile(d, q)) if len(d) else 0.0)
+    radii_arr = np.asarray(radii, dtype=np.float32) * factor
+    abs_cap = float(cfg.get("cluster.assign_max_dist", 0) or 0)
+    if abs_cap > 0:
+        radii_arr = np.minimum(radii_arr, abs_cap)
+    LOG.info("归组：%d 个簇，阈值中位数 %.4f（%.0f%% 分位 × %.2f）",
+             len(order), float(np.median(radii_arr)), q * 100, factor)
+
+    assigned = 0
+    order_np = np.asarray(order, dtype=np.int64)
+    for st in range(0, len(target), 20000):
+        chunk = target[st:st + 20000]
+        d2 = ((y[chunk][:, None, :] - cents[None, :, :]) ** 2).sum(axis=2)
+        nearest = d2.argmin(axis=1)
+        dist = np.sqrt(d2[np.arange(len(chunk)), nearest])
+        ok = dist <= radii_arr[nearest]
+        labels[chunk[ok]] = order_np[nearest[ok]]
+        assigned += int(ok.sum())
+    return assigned
+
+
+def cluster_with_sampling(cfg: Config, y: np.ndarray) -> Tuple[np.ndarray, str]:
+    """人脸太多时多轮抽样拟合，避免一次性 HDBSCAN 栈溢出（0xC00000FD）。
+
+    每轮：从「还没归组」的点里抽 max_fit 个做 HDBSCAN，其余按簇心半径并入；
+    循环到剩余 <= max_fit 时，对剩余点直接拟合一次。
+    这样新出现的人群（只在抽样外的点里）也能形成自己的簇，而不会全被记噪音。
+    """
+    n = int(y.shape[0])
+    max_fit = int(cfg.get("cluster.max_fit_faces", 120_000) or 0)
+    if max_fit <= 0 or n <= max_fit:
+        return run_hdbscan(cfg, y), f"hdbscan(full {n:,})"
+
+    rng = np.random.default_rng(int(cfg.get("cluster.sample_seed", 42)))
+    labels = np.full(n, -1, dtype=np.int64)
+    pending = np.arange(n, dtype=np.int64)
+    rounds = 0
+    max_rounds = int(cfg.get("cluster.max_fit_rounds", 4) or 4)
+    while len(pending) > max_fit and rounds < max_rounds:
+        rounds += 1
+        sub = rng.choice(pending, size=max_fit, replace=False)
+        sub.sort()
+        LOG.info("第 %d 轮：从 %d 个未归组人脸中抽样 %d 拟合 HDBSCAN",
+                 rounds, len(pending), max_fit)
+        labels[sub] = run_hdbscan(cfg, y[sub])
+        mask = np.ones(n, dtype=bool)
+        mask[sub] = False
+        target = np.where(mask & (labels < 0))[0]
+        got = _assign_by_centroid(cfg, y, labels, sub, target)
+        assigned_ids = target[labels[target] >= 0]
+        LOG.info("第 %d 轮：拟合噪声之外的 %d 张脸里归入 %d 张，剩余 %d",
+                 rounds, len(target), got, len(pending) - len(sub) - got)
+        pending = np.array([i for i in pending if labels[i] < 0], dtype=np.int64)
+        if got == 0:
+            break
+
+    if len(pending):
+        LOG.info("最后一批：对剩余 %d 张人脸直接拟合", len(pending))
+        labels[pending] = run_hdbscan(cfg, y[pending])
+
+    n_clusters = len({int(v) for v in labels if v >= 0})
+    LOG.info("多轮抽样分组完成：%d 轮，%d 个簇，噪声 %d（%.1f%%）",
+             rounds, n_clusters, int((labels == -1).sum()),
+             (labels == -1).sum() / n * 100)
+    return labels, f"hdbscan(multi-round x{rounds}, {n:,} faces)"
+
+
 def run_hdbscan(cfg: Config, y: np.ndarray) -> np.ndarray:
     try:
         from sklearn.cluster import HDBSCAN  # sklearn >= 1.3 自带，无需额外依赖
@@ -168,7 +248,38 @@ def run_hdbscan(cfg: Config, y: np.ndarray) -> np.ndarray:
         allow_single_cluster=False,
     )
     t0 = time.monotonic()
-    labels = model.fit_predict(y)
+    # Windows 默认线程栈只有 1MB，HDBSCAN 在几十万点上递归会 STATUS_STACK_OVERFLOW
+    # （进程直接死，Python 抓不住）。这里显式开一个 128MB 栈的线程跑 fit。
+    import threading
+
+    result: Dict[str, Any] = {}
+
+    def _fit() -> None:
+        try:
+            result["labels"] = model.fit_predict(y)
+        except BaseException as exc:  # noqa: BLE001 - 包括 MemoryError
+            result["error"] = exc
+
+    try:
+        old_stack = threading.stack_size(128 * 1024 * 1024)
+    except (ValueError, RuntimeError):
+        old_stack = None
+    try:
+        th = threading.Thread(target=_fit, name="hdbscan-fit")
+        th.start()
+        th.join()
+    finally:
+        if old_stack is not None:
+            try:
+                threading.stack_size(old_stack)
+            except (ValueError, RuntimeError):
+                pass
+
+    if "error" in result:
+        raise RuntimeError(f"HDBSCAN 失败：{result['error']}")
+    labels = result.get("labels")
+    if labels is None:
+        raise RuntimeError("HDBSCAN 没有返回结果（线程异常退出）")
     LOG.info("HDBSCAN 完成：%.1fs，簇数 %d，噪声 %d",
              time.monotonic() - t0, len(set(labels)) - (1 if -1 in labels else 0),
              int((labels == -1).sum()))
@@ -259,7 +370,7 @@ def run(cfg: Config, *, trial: bool = False,
     y, backend = reduce_dims(cfg, x)
     T.tick()
     T.say(f"降维完成（{backend}），正在自动分组…")
-    labels = run_hdbscan(cfg, y)
+    labels, hdb_method = cluster_with_sampling(cfg, y)
     T.tick()
 
     conf = _cluster_confidence(x, labels)
@@ -378,9 +489,344 @@ def _count_all_faces(cfg: Config, conn=None) -> int:
             conn.close()
 
 
+
+
+# --------------------------------------------------------------------------- #
+# 人工修正：命名 / 合并 / 拆分 / 撤销（规格 §6.5「聚类一定会错，错得有出口」）
+# --------------------------------------------------------------------------- #
+
+
+def _v(cfg: Config, version: Optional[str]) -> str:
+    v = version or current_version(cfg)
+    if not v:
+        raise RuntimeError("还没有任何分组结果，先跑一次自动分组。")
+    return v
+
+
+def _op(cfg: Config, version: str, action: str, payload: Dict[str, Any]) -> int:
+    from . import db as D
+
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        cur = conn.execute(
+            "INSERT INTO cluster_ops(at, version, action, payload, undone) "
+            "VALUES (?,?,?,?,0)",
+            (local_now_iso(), version, action, json.dumps(payload, ensure_ascii=False)))
+        conn.commit()
+        return int(cur.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def refresh_meta_for_root(cfg: Config, root_prefix: str,
+                          version: Optional[str] = None) -> int:
+    """素材根被停用/启用后，重算「包含它的人脸」的所有组的人数与封面。
+
+    停用时如果只是把 files.visible 置 0 而不重算，cluster_meta 里的人数与封面
+    还是旧的，照片墙会继续显示这些组（2026-10-26 实测：2,155 组全部成员已不可见、
+    2,432 组封面失效，卡片却照旧）。
+    人数按「可见成员」重算；可见成员为 0 的组会被 `_refresh_meta` 从 meta 里删掉，
+    卡片随之消失。返回重算的组数。
+    """
+    from . import db as D
+
+    v = version or current_version(cfg)
+    if not v:
+        return 0
+    pref = str(root_prefix)
+    like = pref + "%"
+    conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+    try:
+        ids = [int(r[0]) for r in conn.execute(
+            "SELECT DISTINCT fc.cluster_id FROM face_clusters fc "
+            "JOIN face_records fr ON fr.face_id = fc.face_id "
+            "JOIN files f ON f.file_id = fr.file_id "
+            "WHERE fc.version=? AND fc.cluster_id >= 0 "
+            "  AND (f.root=? OR f.path LIKE ?)", (v, pref, like))]
+    finally:
+        conn.close()
+    if not ids:
+        return 0
+    for i in range(0, len(ids), 200):
+        _refresh_meta(cfg, v, ids[i:i + 200])
+    LOG.info("素材根 %s 变更：重算了 %d 个分组的人数与封面", pref, len(ids))
+    return len(ids)
+
+
+def _refresh_meta(cfg: Config, version: str, cluster_ids: List[int]) -> None:
+    """重算这些组的人数与封面（封面取清晰度最高的一张）。"""
+    from . import db as D
+
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        for cid in cluster_ids:
+            # 只统计**还能显示**的人脸：源文件被删/移走后 face_records 会被标 missing，
+            # 它们不该继续算进「这一组多少张」。原来没加这个条件，
+            # 于是重算完人数还是原值（2026-10-22 实测：747 一直不变）。
+            row = conn.execute(
+                "SELECT COUNT(*) n FROM face_clusters fc "
+                "JOIN face_records fr ON fr.face_id = fc.face_id "
+                "LEFT JOIN files f2 ON f2.file_id = fr.file_id "
+                "WHERE fc.version=? AND fc.cluster_id=? AND fr.status='alive' "
+                "  AND (f2.file_id IS NULL OR f2.visible=1)",
+                (version, cid)).fetchone()
+            n = int(row["n"] or 0)
+            if n == 0:
+                conn.execute("DELETE FROM cluster_meta WHERE version=? AND cluster_id=?",
+                             (version, cid))
+                continue
+            # 封面必须来自「源文件还在」的人脸，否则点开就报文件不存在。
+            # 先按这个条件挑；一个都没有才退回原来的排序。
+            cover = conn.execute(
+                "SELECT fc.face_id, fc.confidence FROM face_clusters fc "
+                "JOIN face_records fr ON fr.face_id=fc.face_id "
+                "LEFT JOIN files f2 ON f2.file_id=fr.file_id "
+                "WHERE fc.version=? AND fc.cluster_id=? AND fr.status='alive' "
+                "  AND (f2.status IS NULL OR f2.status != 'missing') "
+                "  AND (f2.visible IS NULL OR f2.visible=1) "
+                "ORDER BY fr.quality DESC, fc.face_id LIMIT 1",
+                (version, cid)).fetchone()
+            if cover is None:
+                cover = conn.execute(
+                    "SELECT fc.face_id, fc.confidence FROM face_clusters fc "
+                    "JOIN face_records fr ON fr.face_id=fc.face_id "
+                    "WHERE fc.version=? AND fc.cluster_id=? "
+                    "ORDER BY fr.quality DESC, fc.face_id LIMIT 1",
+                    (version, cid)).fetchone()
+            old = conn.execute("SELECT name, confidence FROM cluster_meta "
+                               "WHERE version=? AND cluster_id=?", (version, cid)).fetchone()
+            name = old["name"] if old else None
+            conf = float(old["confidence"]) if old and old["confidence"] is not None else 0.0
+            conn.execute(
+                "INSERT INTO cluster_meta(version, cluster_id, size, confidence, "
+                "cover_face_id, name, reviewed) VALUES (?,?,?,?,?,?,COALESCE("
+                "(SELECT reviewed FROM cluster_meta WHERE version=? AND cluster_id=?),0)) "
+                "ON CONFLICT(version, cluster_id) DO UPDATE SET "
+                "size=excluded.size, cover_face_id=excluded.cover_face_id, "
+                "name=COALESCE(cluster_meta.name, excluded.name)",
+                (version, cid, n, conf, int(cover["face_id"]) if cover else None,
+                 name, version, cid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_name(cfg: Config, cluster_id: int, name: str,
+             version: Optional[str] = None) -> Dict[str, Any]:
+    """给某个组起名字（用户指定当前组人员姓名）。"""
+    from . import db as D
+
+    v = _v(cfg, version)
+    nm = str(name or "").strip()[:64]
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        row = conn.execute("SELECT size FROM cluster_meta WHERE version=? AND cluster_id=?",
+                           (v, cluster_id)).fetchone()
+        if row is None:
+            raise RuntimeError(f"第 {cluster_id} 组不存在（版本 {v}）。")
+        conn.execute("UPDATE cluster_meta SET name=? WHERE version=? AND cluster_id=?",
+                     (nm or None, v, cluster_id))
+        conn.commit()
+    finally:
+        conn.close()
+    _op(cfg, v, "rename", {"cluster_id": cluster_id, "name": nm})
+    T.init(cfg)
+    T.emit(cfg, "clusters_changed", {"version": v, "action": "rename"})
+    LOG.info("第 %s 组命名为 %r", cluster_id, nm)
+    return {"cluster_id": cluster_id, "name": nm}
+
+
+def merge_groups(cfg: Config, src_id: int, dst_id: int,
+                 version: Optional[str] = None) -> Dict[str, Any]:
+    """把 src_id 组整个并入 dst_id 组。"""
+    from . import db as D
+
+    v = _v(cfg, version)
+    if int(src_id) == int(dst_id):
+        raise ValueError("同一个组不能合并到自己。")
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        faces = [int(r["face_id"]) for r in conn.execute(
+            "SELECT face_id FROM face_clusters WHERE version=? AND cluster_id=?",
+            (v, int(src_id)))]
+        if not faces:
+            raise RuntimeError(f"第 {src_id} 组里没有人脸。")
+        conn.executemany(
+            "UPDATE face_clusters SET cluster_id=? WHERE version=? AND face_id=?",
+            [(int(dst_id), v, f) for f in faces])
+        conn.commit()
+    finally:
+        conn.close()
+    _refresh_meta(cfg, v, [int(src_id), int(dst_id)])
+    _op(cfg, v, "merge", {"src": int(src_id), "dst": int(dst_id), "faces": faces})
+    T.init(cfg)
+    T.emit(cfg, "clusters_changed", {"version": v, "action": "merge"})
+    LOG.info("合并：第 %s 组 %d 张 → 第 %s 组", src_id, len(faces), dst_id)
+    return {"moved": len(faces), "src": src_id, "dst": dst_id}
+
+
+def split_group(cfg: Config, cluster_id: int, face_ids: List[int],
+                version: Optional[str] = None) -> Dict[str, Any]:
+    """把选中的若干张脸从组里拆出去，成立一个新组。"""
+    from . import db as D
+
+    v = _v(cfg, version)
+    if not face_ids:
+        raise ValueError("没有选中任何人脸。")
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        mx = conn.execute("SELECT COALESCE(MAX(cluster_id),-1) m FROM cluster_meta "
+                          "WHERE version=?", (v,)).fetchone()
+        new_id = int(mx["m"]) + 1
+        conn.executemany(
+            "UPDATE face_clusters SET cluster_id=? WHERE version=? AND face_id=?",
+            [(new_id, v, int(f)) for f in face_ids])
+        conn.commit()
+    finally:
+        conn.close()
+    _refresh_meta(cfg, v, [int(cluster_id), new_id])
+    _op(cfg, v, "split", {"src": int(cluster_id), "new": new_id,
+                          "faces": [int(f) for f in face_ids]})
+    T.init(cfg)
+    T.emit(cfg, "clusters_changed", {"version": v, "action": "split"})
+    LOG.info("拆分：从第 %s 组取出 %d 张 → 新第 %s 组", cluster_id, len(face_ids), new_id)
+    return {"moved": len(face_ids), "src": cluster_id, "new": new_id}
+
+
+def undo_last(cfg: Config, version: Optional[str] = None) -> Dict[str, Any]:
+    """撤销最近一次合并/拆分（命名不可撤销，改回来即可）。"""
+    from . import db as D
+
+    v = _v(cfg, version)
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        row = conn.execute(
+            "SELECT op_id, action, payload FROM cluster_ops "
+            "WHERE version=? AND undone=0 AND action IN ('merge','split') "
+            "ORDER BY op_id DESC LIMIT 1", (v,)).fetchone()
+        if row is None:
+            raise RuntimeError("没有可撤销的合并/拆分操作。")
+        op_id = int(row["op_id"])
+        payload = json.loads(row["payload"] or "{}")
+        action = str(row["action"])
+        if action == "merge":
+            back = int(payload["src"])
+        else:
+            back = int(payload["src"])
+        moves = payload.get("faces") or []
+        # 撤销：把这些人脸放回原来的组
+        if action == "split":
+            # 拆出去的人脸原来都在 src 组
+            conn.executemany(
+                "UPDATE face_clusters SET cluster_id=? WHERE version=? AND face_id=?",
+                [(int(payload["src"]), v, int(f)) for f in moves])
+            conn.execute("DELETE FROM cluster_meta WHERE version=? AND cluster_id=?",
+                         (v, int(payload["new"])))
+            touched = [int(payload["src"])]
+        else:
+            conn.executemany(
+                "UPDATE face_clusters SET cluster_id=? WHERE version=? AND face_id=?",
+                [(int(payload["src"]), v, int(f)) for f in moves])
+            touched = [int(payload["src"]), int(payload["dst"])]
+        conn.execute("UPDATE cluster_ops SET undone=1 WHERE op_id=?", (op_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    _refresh_meta(cfg, v, touched)
+    T.init(cfg)
+    T.emit(cfg, "clusters_changed", {"version": v, "action": "undo"})
+    LOG.info("已撤销操作 #%s（%s），影响 %d 张脸", op_id, action, len(moves))
+    return {"undone": action, "faces": len(moves)}
+
+
+
+
+def match_names(cfg: Config, text: str, version: Optional[str] = None,
+                limit: int = 12) -> List[Dict[str, Any]]:
+    """按人名匹配分组（检索词里出现「给这组起的名字」时优先展示该组）。
+
+    为什么要这个：用户给人起过名字之后，最自然的检索就是直接打名字。
+    纯向量检索对「名字」无能为力（名字不在画面上），只能靠这张表兜。
+    """
+    from . import db as D
+
+    t = str(text or "").strip()
+    if len(t) < 2:
+        return []
+    v = version or current_version(cfg)
+    if not v:
+        return []
+    conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT m.cluster_id, m.name, m.size, m.confidence, m.cover_face_id, "
+            "fr.thumb_path, fr.file_id, f.path AS file_path "
+            "FROM cluster_meta m "
+            "LEFT JOIN face_records fr ON fr.face_id = m.cover_face_id "
+            "LEFT JOIN files f ON f.file_id = fr.file_id "
+            "WHERE m.version=? AND m.name IS NOT NULL AND m.name != '' "
+            "  AND (m.name LIKE ? OR ? LIKE '%' || m.name || '%') "
+            "ORDER BY m.size DESC LIMIT ?",
+            (v, f"%{t}%", t, limit)).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+
+
+def group_of_face(cfg: Config, face_id: int,
+                  version: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """这张脸属于哪一组（当前版本）。未分组返回 None。"""
+    from . import db as D
+
+    v = version or current_version(cfg)
+    if not v:
+        return None
+    conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+    try:
+        row = conn.execute(
+            "SELECT fc.cluster_id, fc.confidence, m.name, m.size, m.cover_face_id "
+            "FROM face_clusters fc LEFT JOIN cluster_meta m "
+            "  ON m.version = fc.version AND m.cluster_id = fc.cluster_id "
+            "WHERE fc.version=? AND fc.face_id=?", (v, int(face_id))).fetchone()
+    finally:
+        conn.close()
+    if row is None or int(row["cluster_id"]) < 0:
+        return None
+    return dict(row)
+
+
 # --------------------------------------------------------------------------- #
 # 读取（给界面用）
 # --------------------------------------------------------------------------- #
+
+
+def live_meta_stats(cfg: Config, version: Optional[str] = None) -> Dict[str, int]:
+    """当前**可见**的分组统计（按 cluster_meta 现算，不受停用/删除影响）。
+
+    集群完成时会把当时的组数/人数写进 cluster_runs，那是**历史快照**；
+    停用某个素材根后实际可见的组会变少，界面必须显示实时值，
+    否则用户会以为「停用没生效」（2026-10-26 实测就是这样）。
+    """
+    from . import db as D
+
+    v = version or current_version(cfg)
+    if not v:
+        return {"groups": 0, "faces": 0}
+    try:
+        conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+    except Exception:  # noqa: BLE001
+        return {"groups": 0, "faces": 0}
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(size), 0) faces FROM cluster_meta "
+            "WHERE version=?", (v,)).fetchone()
+        return {"groups": int(row["n"] or 0), "faces": int(row["faces"] or 0)}
+    except Exception:  # noqa: BLE001
+        return {"groups": 0, "faces": 0}
+    finally:
+        conn.close()
 
 
 def groups_overview(cfg: Config, version: Optional[str] = None,

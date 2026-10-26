@@ -86,7 +86,7 @@ def test_tasks(cfg) -> None:
     # 把开始时间往前拨 10 秒，验证速率与预计剩余真的会算
     conn = D.connect(cfg.db_path, cfg=cfg)
     try:
-        conn.execute("UPDATE tasks SET started_at='2026-01-01T00:00:00' WHERE task_id=?",
+        conn.execute("UPDATE tasks SET started_at='2026-01-01T00:00:00', stage_started_at='2026-01-01T00:00:00' WHERE task_id=?",
                      (tid,))
         conn.commit()
     finally:
@@ -115,14 +115,30 @@ def test_tasks(cfg) -> None:
     # 僵尸回收：running 且心跳很旧（updated_at 由 tick 维护，测试里直接改库来造场景）
     conn = D.connect(cfg.db_path, cfg=cfg)
     try:
-        conn.execute("UPDATE tasks SET state='running', updated_at='2020-01-01T00:00:00' "
-                     "WHERE task_id=?", (tid2,))
+        conn.execute("UPDATE tasks SET state='running', cancel=0, "
+                     "updated_at='2020-01-01T00:00:00' WHERE task_id=?", (tid2,))
         conn.commit()
     finally:
         conn.close()
     n = T.reap_stale(cfg, minutes=5)
-    check("僵尸 running 被回收成 failed", n >= 1 and T.get(cfg, tid2)["state"] == "failed",
+    # 没点停止、进程已死 → failed（异常退出）
+    check("僵尸 running（未点停止）被回收成 failed",
+          n >= 1 and T.get(cfg, tid2)["state"] == "failed",
           f"n={n} state={T.get(cfg, tid2)['state']}")
+
+    # 点了停止、进程已死 → cancelled（正常停止，不是失败）
+    conn = D.connect(cfg.db_path, cfg=cfg)
+    try:
+        conn.execute("UPDATE tasks SET state='running', cancel=1, "
+                     "updated_at='2020-01-01T00:00:00', finished_at=NULL, "
+                     "message='正在停止…' WHERE task_id=?", (tid2,))
+        conn.commit()
+    finally:
+        conn.close()
+    T.reap_stale(cfg, minutes=5)
+    st2 = T.get(cfg, tid2)["state"]
+    check("cancel=1 的僵尸被回收成 cancelled（不再卡在「正在停止」）",
+          st2 == "cancelled", st2)
 
     # 历史清理
     removed = T.purge_history(cfg, days=-1)     # 负数 = 全部算过期

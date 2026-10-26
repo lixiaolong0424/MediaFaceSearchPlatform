@@ -67,15 +67,28 @@ MAX_FACES_PER_FILE = 400
 
 
 def imread_bgr(path: Path) -> Optional[np.ndarray]:
+    """读图成 BGR。cv2 读不了的格式（HEIC/HEIF）回退到 PIL。"""
     import cv2
 
     try:
         buf = np.fromfile(str(path), dtype=np.uint8)
         if buf.size == 0:
             return None
-        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
     except Exception as exc:  # noqa: BLE001
-        LOG.debug("读图失败 %s：%s", path, exc)
+        LOG.debug("cv2 读图失败 %s：%s", path, exc)
+
+    # 回退：OpenCV 不支持 HEIC/HEIF，但注册过 pillow-heif 之后 PIL 可以
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            rgb = np.asarray(im.convert("RGB"))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("PIL 读图也失败 %s：%s", path, exc)
         return None
 
 
@@ -537,6 +550,7 @@ def run_detect(args, cfg: Config) -> Dict[str, Any]:
     batch = max(1, int(cfg.get("scan.batch_commit_files", 500)))
     for i, r in enumerate(rows, 1):
         fid, kind, ps = int(r["file_id"]), str(r["kind"]), str(r["path"])
+        T.current(ps)
         if not Path(ps).exists():
             conn.execute("UPDATE files SET status='missing', updated_at=? WHERE file_id=?",
                          (local_now_iso(), fid))
@@ -633,6 +647,9 @@ def encode_file_faces(
     failed: List[int] = []
 
     for r in rows:
+        # 每个文件开头响应一次「停止任务」。没有这一行时，
+        # 点停止后本阶段会一直把整批跑完（实测抽帧 1976 个文件 ≈ 几十分钟）。
+        T.cancelled()   # 命中会抛 TaskCancelled，由外层脚本返回退出码 130
         face_id = int(r["face_id"])
         raw = Path(str(r["raw_path"])) if r["raw_path"] else None
         img = imread_bgr(raw) if (raw and raw.exists()) else None

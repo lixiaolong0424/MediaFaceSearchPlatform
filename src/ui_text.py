@@ -88,7 +88,7 @@ TEXTS: Dict[str, str] = {
     "task.col.state": "状态",
     "task.col.result": "处理结果",
     "task.col.took": "耗时",
-    "task.remaining": "预计剩余",
+    "task.remaining": "本步预计剩余",
     "task.rate": "速度",
     "task.no_eta": "估算中…",
 

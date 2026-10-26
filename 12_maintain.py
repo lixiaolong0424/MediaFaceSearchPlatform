@@ -748,6 +748,41 @@ def cmd_fix_status(cfg: Config, args) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def cmd_purge_missing(cfg, args) -> dict:
+    """清理「缺失」文件的记录与向量。默认只报告；--apply 才真删。
+
+    界面上的「删除记录与向量」如果因为某些原因失效，可以用它兜底：
+        .venv\\Scripts\\python.exe 12_maintain.py purge-missing            # 只报告
+        .venv\\Scripts\\python.exe 12_maintain.py purge-missing --apply    # 真删
+        .venv\\Scripts\\python.exe 12_maintain.py purge-missing --apply --limit 100
+    """
+    from src import migrate as MG
+
+    rep = MG.purge_missing(cfg, None, dry_run=True)
+    would = int(rep.get("would_purge") or 0)
+    if not getattr(args, "apply", False):
+        return {"dry_run": True, "would_purge": would,
+                "samples": rep.get("samples", [])[:5]}
+    ids = None
+    limit = int(getattr(args, "purge_max", 0) or 0)
+    if limit > 0:
+        import sqlite3
+
+        from src import db as D
+
+        conn = D.connect(cfg.db_path, cfg=cfg, readonly=True)
+        try:
+            ids = [int(r[0]) for r in conn.execute(
+                "SELECT file_id FROM files WHERE status='missing' "
+                "ORDER BY file_id LIMIT ?", (limit,))]
+        finally:
+            conn.close()
+    res = MG.purge_missing(cfg, ids, dry_run=False)
+    left = int(MG.missing_report(cfg, limit=1)["total"] or 0)
+    return {"dry_run": False, "purged": int(res.get("purged") or 0),
+            "missing_before": would, "missing_left": left}
+
+
 COMMANDS = {
     "status": cmd_status,
     "migrate": cmd_migrate,
@@ -760,6 +795,7 @@ COMMANDS = {
     "rotate-logs": cmd_rotate_logs,
     "fix-skipped-dup": cmd_fix_skipped_dup,
     "fix-status": cmd_fix_status,
+    "purge-missing": cmd_purge_missing,
 }
 
 
@@ -770,6 +806,10 @@ def main(argv=None) -> int:
     p.add_argument("--days", type=int, default=30, help="clean-frames / rotate-logs 的天数阈值")
     p.add_argument("--no-disk", action="store_true",
                    help="status 时跳过 NVMe 目录统计（省约 21 秒，看进度时用）")
+    p.add_argument("--apply", action="store_true",
+                   help="purge-missing 的二次确认（不加则只报告）")
+    p.add_argument("--max", type=int, default=0, dest="purge_max",
+                   help="purge-missing 只处理前 N 条（0=全部）")
     p.add_argument("--confirm", action="store_true",
                    help="prune-orphans 的二次确认（不加则只输出 dry-run 报告）")
     args = p.parse_args(argv)
