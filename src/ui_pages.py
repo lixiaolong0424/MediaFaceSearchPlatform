@@ -96,17 +96,39 @@ def page_tasks(cfg: Config) -> None:
 # =========================================================================== #
 
 
+def _clamp_num(value: Any, s: Setting, *, is_int: bool) -> Any:
+    """把配置值夹到设置项允许的区间内。
+
+    为什么需要：配置里缺键、或历史值越界时，`number_input(value=0, min_value=1000)`
+    会让 Streamlit 直接抛异常，**整个设置页打不开**（2026-10-26 真实事故：
+    `cluster.max_fit_faces` 写错层级取到 0，min 是 1000）。
+    这里统一夹紧：缺值取 vmin（没有就用 0），越界取边界。
+    """
+    conv = int if is_int else float
+    try:
+        v = conv(value) if value is not None else None
+    except (TypeError, ValueError):
+        v = None
+    if v is None:
+        v = conv(s.vmin) if s.vmin is not None else conv(0)
+    if s.vmin is not None and v < conv(s.vmin):
+        v = conv(s.vmin)
+    if s.vmax is not None and v > conv(s.vmax):
+        v = conv(s.vmax)
+    return v
+
+
 def _widget(s: SS.Setting, value: Any, key: str) -> Any:
     label = s.label + ("（改完需重新扫描）" if s.rescan else "")
     if s.kind == "bool":
         return st.checkbox(label, value=bool(value), key=key, help=s.help or None)
     if s.kind == "int":
-        return int(st.number_input(label, value=int(value or 0),
+        return int(st.number_input(label, value=_clamp_num(value, s, is_int=True),
                                    min_value=int(s.vmin) if s.vmin is not None else None,
                                    max_value=int(s.vmax) if s.vmax is not None else None,
                                    step=int(s.step or 1), key=key, help=s.help or None))
     if s.kind == "float":
-        return float(st.number_input(label, value=float(value or 0.0),
+        return float(st.number_input(label, value=_clamp_num(value, s, is_int=False),
                                      min_value=float(s.vmin) if s.vmin is not None else None,
                                      max_value=float(s.vmax) if s.vmax is not None else None,
                                      step=float(s.step or 0.01), format="%.4f",

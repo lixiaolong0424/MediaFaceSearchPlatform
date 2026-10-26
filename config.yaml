@@ -457,6 +457,16 @@ cluster:
   hdbscan_min_samples: 2
   hdbscan_cluster_selection_epsilon: 0.15
   hdbscan_cluster_selection_method: leaf
+  # --- 大库保护（2026-10-26 崩溃后加入）---
+  # 一次 HDBSCAN 最多拟合多少张脸；超过就先抽样，其余按最近簇心分配。
+  # 30 万点一次性拟合会让进程栈溢出（退出码 3221225725），实测 19.8 万可完成。
+  max_fit_faces: 120000
+  # 抽样外的脸归组阈值 = 簇半径 95 分位 × 这个系数（随数据尺度自适应）
+  assign_dist_factor: 1.2
+  # 归组距离绝对上限（0 = 不设上限，只用上面的自适应阈值）
+  assign_max_dist: 0
+  sample_seed: 42
+  max_fit_rounds: 4
   # 试跑样本量：先在这里的数字上量内存峰值，再线性外推到全量（规格 §6.3 硬约束）
   trial_sample: 100000
   # 簇内平均相似度低于这个值 → 标为「待审核」（规格 §15.7）
@@ -511,13 +521,3 @@ performance:
   encode_group: 0                # 0=沿用 semantic.group_size；turbo 建议 12
 
 # --- 自动分组：大库保护（2026-10-26 崩溃后加入）--------------------------------
-cluster_extra:
-  # 一次 HDBSCAN 最多拟合多少张脸。超过就先抽样拟合，其余按最近簇心分配。
-  # 30 万点一次性拟合会让进程栈溢出（退出码 3221225725），实测 19.8 万可完成。
-  max_fit_faces: 120000
-  # 抽样外的脸按「到最近簇心的距离」归组：
-  #   阈值 = 簇半径中位数 × assign_dist_factor（自动随数据尺度缩放）
-  assign_dist_factor: 1.6
-  # 绝对上限（0 = 不设上限，只按上面的自适应阈值）
-  assign_max_dist: 0
-  sample_seed: 42
