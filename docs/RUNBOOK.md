@@ -207,3 +207,33 @@ Copy-Item data\library.db D:\backup\library-$(Get-Date -f yyyyMMdd-HHmm).db
 3. 设置 → 路径变更向导（会 UPDATE 全库 path；历史上误用过一次，已加 20% 阈值拦截）
 4. `git checkout -- .` / `git reset --hard`（会丢掉未提交的改动）
 5. 强杀 `03_extract` 等进程（正常停止请用任务页按钮；强杀最多丢当前 1 个文件的进度）
+---
+
+## 9. 网络 / 推送（2026-10-26 实测）
+
+本机的情况：**github.com:22 被中间设备劫持**——服务器给出的主机指纹不是 GitHub 的，
+而且支持 password 认证（真 GitHub 只支持公钥）。表现是「公钥明明加了，却一直
+Permission denied (publickey,password,keyboard-interactive)」。
+
+修法（已写好 ~\.ssh\config）：
+
+`
+Host github.com
+    HostName ssh.github.com
+    Port 443
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+`
+
+* gitcode.com:22 在本机是正常的，不需要改
+* 验证：ssh -T git@github.com 应回 Hi <用户名>! You've successfully authenticated
+* 一键推送：双击根目录 push.bat（会自检通道、提交、推两端、回读远端 sha）
+
+自查命令：
+
+`powershell
+ssh -T git@github.com                       # 应显示 Hi xxx
+git ls-remote --heads github                # 应列出 refs/heads/main
+git ls-remote --heads gitcode
+`

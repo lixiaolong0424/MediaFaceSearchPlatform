@@ -208,6 +208,7 @@ logs/  tmp/       日志与临时脚本（**不进 git**）
 | 10 | **`Path.resolve()` 会把路径变成 8.3 短名**（`LIXIAO~1`），前缀匹配失败 | 停用/清理同时按「原样前缀 + resolve 后前缀」匹配（`_root_conditions`） |
 | 11 | **换 `media_root` 走全局差集会把全库标 missing**（历史事故，已修为按根限定） | 多根用 `media_roots` 登记；扫子目录注意 `root` 字段 |
 | 12 | **`start.bat` 必须 CRLF** | 用编辑器改过后确认行尾，或重跑生成脚本 |
+| 13 | **github.com:22 被中间设备劫持**（指纹不是 GitHub 的、服务器还支持 password 认证）→ 公钥加了也 Permission denied (publickey,password,keyboard-interactive) | ~/.ssh/config 让 github 走 ssh.github.com:443；gitcode 的 22 端口在本机正常 |
 
 ---
 
